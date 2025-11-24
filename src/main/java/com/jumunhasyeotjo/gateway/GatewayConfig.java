@@ -13,7 +13,15 @@ public class GatewayConfig {
         return builder.routes()
             .route("user-interact", r -> r
                 .path("/v1/auth/**", "/v1/users/**", "/v1/messages/**")
-                .uri("http://localhost:8081")
+                .uri("http://localhost:8085")
+            )
+            .route("order-shipping-service", r -> r
+                .path("/v1/orders/**", "/v1/shippings/**")
+                .uri("http://localhost:8086")
+            )
+            .route("hub-product-stock-company", r -> r
+                .path("/api/v1/hubs/**", "/api/v1/stocks/**", "/api/v1/products/**", "/api/v1/companies/**")
+                .uri("http://localhost:8087")
             )
             .build();
     }
