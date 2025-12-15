@@ -13,7 +13,7 @@ jwt:
 eureka:
   client:
     service-url:
-      defaultZone: ${EUREKA_SERVER}
+      defaultZone: jumunhasyeo-dev-alb-702859584.ap-northeast-2.elb.amazonaws.com/eureka/
 
 management:
   endpoints:
