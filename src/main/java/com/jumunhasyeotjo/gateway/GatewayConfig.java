@@ -12,7 +12,7 @@ public class GatewayConfig {
     public RouteLocator routes(RouteLocatorBuilder builder) {
         return builder.routes()
                 .route("user-service", r -> r
-                        .path("/user/api/v1/auth/**", "/user/api/v1/users/**", "/user/api/v1/messages/**", "/user/api/v1/passports/**")
+                        .path("/api/v1/auth/**", "/api/v1/users/**", "/api/v1/messages/**", "/api/v1/passports/**")
                         .uri("lb://user-service")
                 )
                 .route("user-service-actuator", r -> r
@@ -24,11 +24,11 @@ public class GatewayConfig {
                         .uri("lb://user-service")
                 )
                 .route("order-to-shipping-service", r -> r
-                        .path("/order/api/v1/orders/**", "/order/api/v1/coupons/**", "/order/api/v1/shippings/**", "/order/api/v1/payments/**", "/order/api/v1/shipping-histories/**")
+                        .path("/api/v1/orders/**", "/api/v1/coupons/**", "/api/v1/shippings/**", "/api/v1/payments/**", "/api/v1/shipping-histories/**")
                         .uri("lb://order-to-shipping-service")
                 )
                 .route("hub-product-stock-company", r -> r
-                        .path("/hub/api/v1/hubs/**", "/hub/api/v1/stocks/**", "/hub/api/v1/products/**", "/hub/api/v1/companies/**")
+                        .path("/api/v1/hubs/**", "/api/v1/stocks/**", "/api/v1/products/**", "/api/v1/companies/**")
                         .uri("lb://hub-product-stock-company")
                 )
                 .build();
