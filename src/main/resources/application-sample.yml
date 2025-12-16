@@ -25,3 +25,9 @@ management:
     metrics:
       export:
         enabled: true
+
+alb:
+  url: ${ALB_INTERNAL_DNS}
+  user-port: ${USER_PORT}
+  hub-port: ${HUB_PORT}
+  order-port: ${ORDER_PORT}
