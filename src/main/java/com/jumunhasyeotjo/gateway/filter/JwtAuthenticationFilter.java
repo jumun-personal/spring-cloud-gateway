@@ -34,8 +34,8 @@ public class JwtAuthenticationFilter implements WebFilter {
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        log.info("JwtAuthenticationFilter 호출, URL={}, Thread={}",
-            exchange.getRequest().getURI(), Thread.currentThread().getName());
+//        log.info("JwtAuthenticationFilter 호출, URL={}, Thread={}",
+//            exchange.getRequest().getURI(), Thread.currentThread().getName());
         String BearerToken = exchange.getRequest().getHeaders().getFirst("Authorization");
         String token = jwtProvider.resolveToken(exchange.getRequest());
 
