@@ -28,7 +28,7 @@ jobs:
   push-image:
     name: Push Image
     runs-on: ubuntu-latest
-    environment: order-aws
+    environment: gateway-aws
     outputs:
       image-tag: ${{ steps.image-info.outputs.image-tag }}
       image-uri: ${{ steps.image-info.outputs.image-uri }}

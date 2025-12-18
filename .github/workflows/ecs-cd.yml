@@ -10,7 +10,7 @@ jobs:
     name: SpringBoot build
     uses: ./.github/workflows/ecs-cd_build.yml
     with:
-      service-name: order
+      service-name: gateway
       java-version: '17'
       github-username: ${{ github.actor }}
     secrets:
@@ -21,8 +21,8 @@ jobs:
     name: ECR Docker
     uses: ./.github/workflows/ecs-cd_push-image.yml
     with:
-      service-name: order
-      ecr-repository: jumunhasyeo-dev-order
+      service-name: gateway
+      ecr-repository: jumunhasyeo-dev-gateway
       aws-region: ap-northeast-2
     secrets:
       github-token: ${{ secrets.GITHUB_TOKEN }}  # ← 명시적 전달 필요
@@ -34,10 +34,10 @@ jobs:
     name: ECS Deploy
     uses: ./.github/workflows/ecs-cd_deploy-ecs.yml
     with:
-      service-name: order
+      service-name: gateway
       ecs-cluster: jumunhasyeo-dev-cluster
-      ecs-service: jumunhasyeo-dev-order
-      parameter-path: /jumunhasyeo/dev/order/
+      ecs-service: jumunhasyeo-dev-gateway
+      parameter-path: /jumunhasyeo/dev/gateway/
       image-uri: ${{ needs.push-image.outputs.image-uri }}
       aws-region: ap-northeast-2
     secrets:
