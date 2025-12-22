@@ -6,7 +6,22 @@ spring:
     import: optional:file:./.env[.properties]
   application:
     name: gateway
-
+  cloud:
+    gateway:
+      globalcors:
+        add-to-simple-url-handler-mapping: true
+        cors-configurations:
+          '[/**]':
+            allowed-origins:
+              - "http://127.0.0.1:5500"
+            allowed-methods:
+              - GET
+              - POST
+              - PATCH
+              - DELETE
+              - OPTIONS
+            allowed-headers: "*"
+            allow-credentials: true
 jwt:
   secret: ${JWT_KEY}
 
