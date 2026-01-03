@@ -5,35 +5,40 @@ import com.jumunhasyeotjo.gateway.jwt.JwtProvider;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
 import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
 import org.springframework.security.config.web.server.ServerHttpSecurity;
 import org.springframework.security.web.server.SecurityWebFilterChain;
-import org.springframework.security.web.server.context.NoOpServerSecurityContextRepository;
 import org.springframework.web.reactive.function.client.WebClient;
 
 @Configuration
 @EnableWebFluxSecurity
 @RequiredArgsConstructor
 public class SecurityConfig {
+
     private final JwtProvider jwtProvider;
-    private final WebClient.Builder webClientBuilder;
+    private final WebClient webClient;  // ← Builder 대신 WebClient
+
     @Bean
     public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
-        JwtAuthenticationFilter jwtAuthenticationFilter = new JwtAuthenticationFilter(jwtProvider, webClientBuilder);
+        // JwtAuthenticationFilter 생성 시 WebClient 전달
+        JwtAuthenticationFilter jwtAuthenticationFilter =
+                new JwtAuthenticationFilter(jwtProvider, webClient);  // ← 수정!
+
         return http
-            .csrf(ServerHttpSecurity.CsrfSpec::disable)
-            .cors(ServerHttpSecurity.CorsSpec::disable)
-            .formLogin(ServerHttpSecurity.FormLoginSpec::disable)
-            .httpBasic(ServerHttpSecurity.HttpBasicSpec::disable)
-            .securityContextRepository(NoOpServerSecurityContextRepository.getInstance())
-            .authorizeExchange(ex -> ex
-                .pathMatchers(HttpMethod.OPTIONS).permitAll()
-                .pathMatchers("/api/v1/auth/**", "/actuator/**", "/monitoring/**").permitAll()
-                .anyExchange().authenticated()
-            )
-            .addFilterAt(jwtAuthenticationFilter, SecurityWebFiltersOrder.AUTHENTICATION)
-            .build();
+                .csrf(ServerHttpSecurity.CsrfSpec::disable)
+                .httpBasic(ServerHttpSecurity.HttpBasicSpec::disable)
+                .formLogin(ServerHttpSecurity.FormLoginSpec::disable)
+                .authorizeExchange(exchange -> exchange
+                        .pathMatchers(
+                                "/api/v1/auth/**",
+                                "/api/v1/hubs/distance/**",
+                                "/api/v1/passports",
+                                "/actuator/**"
+                        ).permitAll()
+                        .anyExchange().authenticated()
+                )
+                .addFilterAt(jwtAuthenticationFilter, SecurityWebFiltersOrder.AUTHENTICATION)
+                .build();
     }
 }
