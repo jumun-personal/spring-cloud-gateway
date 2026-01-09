@@ -1,13 +1,21 @@
 package com.jumunhasyeotjo.gateway.client;
 
+import io.netty.handler.logging.LogLevel;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.client.loadbalancer.LoadBalanced;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.transport.logging.AdvancedByteBufFormat;
+
 
 @Configuration
+@Slf4j
 public class WebClientConfig {
-
     @Bean
     @LoadBalanced
     public WebClient.Builder webClientBuilder() {
@@ -16,6 +24,35 @@ public class WebClientConfig {
 
     @Bean
     public WebClient webClient(WebClient.Builder builder) {
-        return builder.build();
+
+        HttpClient httpClient = HttpClient.create()
+                .wiretap(
+                        "reactor.netty.http.client.HttpClient",
+                        LogLevel.INFO,
+                        AdvancedByteBufFormat.TEXTUAL
+                );
+
+        return builder
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .filter(logRequest())
+                .filter(logResponse())
+                .build();
+    }
+
+    private ExchangeFilterFunction logRequest() {
+        return ExchangeFilterFunction.ofRequestProcessor(request -> {
+            log.info("➡️ REQUEST {} {}", request.method(), request.url());
+            request.headers().forEach((k, v) ->
+                    v.forEach(value -> log.info("➡️ HEADER {}={}", k, value))
+            );
+            return Mono.just(request);
+        });
+    }
+
+    private ExchangeFilterFunction logResponse() {
+        return ExchangeFilterFunction.ofResponseProcessor(response -> {
+            log.info("⬅️ RESPONSE STATUS {}", response.statusCode());
+            return Mono.just(response);
+        });
     }
 }
