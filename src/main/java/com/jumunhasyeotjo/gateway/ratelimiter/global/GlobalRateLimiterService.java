@@ -1,12 +1,10 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
-import io.github.bucket4j.Bandwidth;
-import io.github.bucket4j.Bucket;
-import io.github.bucket4j.BucketConfiguration;
-import io.github.bucket4j.distributed.proxy.ProxyManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.domain.Range;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -18,81 +16,96 @@ import java.util.concurrent.atomic.AtomicInteger;
 @RequiredArgsConstructor
 public class GlobalRateLimiterService {
 
-    private final ProxyManager<String> proxyManager;
+    private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
     private final ApplicationEventPublisher eventPublisher;
-    private static final String BUCKET_KEY = "bucket:global:sliding-window";
+
+    private static final String KEY = "sliding:global:requests";
+    private static final long WINDOW_SIZE_MS = 1000;
     private final AtomicInteger currentLimit = new AtomicInteger(30);
 
     public Mono<Boolean> tryConsume() {
-        return Mono.fromCallable(() -> {
-            Bucket bucket = getBucket();
-            boolean consumed = bucket.tryConsume(1);
+        long now = System.currentTimeMillis();
+        long windowStart = now - WINDOW_SIZE_MS;
+        int limit = currentLimit.get();
 
-            if (consumed) {
-                eventPublisher.publishEvent(new GlobalTokenRefilledEvent(this));
-            }
+        return cleanOldRequests(windowStart)
+                .then(countWindowRequests(windowStart, now))
+                .flatMap(count -> {
+                    if (count >= limit) {
+                        log.debug("Rate limit exceeded: {}/{}", count, limit);
+                        return Mono.just(false);
+                    }
 
-            log.debug("Rate limit check - consumed: {}, available: {}/{}",
-                    consumed, bucket.getAvailableTokens(), currentLimit.get());
-
-            return consumed;
-        });
+                    return recordNewRequest(now)
+                            .doOnSuccess(v -> eventPublisher.publishEvent(
+                                    new GlobalTokenRefilledEvent(this)))
+                            .thenReturn(true);
+                })
+                .onErrorReturn(false);
     }
 
     public Mono<Long> getCurrentWindowCount() {
-        return Mono.fromCallable(() -> {
-            Bucket bucket = getBucket();
-            long available = bucket.getAvailableTokens();
-            long total = currentLimit.get();
-            return total - available;
-        });
+        long now = System.currentTimeMillis();
+        long windowStart = now - WINDOW_SIZE_MS;
+
+        return countWindowRequests(windowStart, now)
+                .onErrorReturn(0L);
     }
 
-    private Bucket getBucket() {
-        int limit = currentLimit.get();
+    /**
+     * 윈도우 밖의 오래된 요청 제거
+     */
+    private Mono<Long> cleanOldRequests(long windowStart) {
+        Range<Double> oldRange = Range.closed(0.0, (double) windowStart);
 
-        BucketConfiguration config = BucketConfiguration.builder()
-                .addLimit(Bandwidth.builder()
-                        .capacity(limit)
-                        .refillIntervally(limit, Duration.ofSeconds(1))
-                        .build()
-                )
-                .build();
-
-        return proxyManager.builder()
-                .build(BUCKET_KEY, () -> config);
+        return reactiveRedisTemplate.opsForZSet()
+                .removeRangeByScore(KEY, oldRange)
+                .doOnNext(removed -> {
+                    if (removed > 0) {
+                        log.debug("Removed {} old requests", removed);
+                    }
+                });
     }
 
-    public void increaseLimit() {
+    /**
+     * 현재 윈도우 내 요청 수 카운트
+     */
+    private Mono<Long> countWindowRequests(long windowStart, long windowEnd) {
+        Range<Double> range = Range.closed((double) windowStart, (double) windowEnd);
+
+        return reactiveRedisTemplate.opsForZSet()
+                .count(KEY, range);
+    }
+
+    /**
+     * 새 요청 기록
+     */
+    private Mono<Boolean> recordNewRequest(long timestamp) {
+        String requestId = timestamp + ":" + Thread.currentThread().getId();
+
+        return reactiveRedisTemplate.opsForZSet()
+                .add(KEY, requestId, timestamp)
+                .then(reactiveRedisTemplate.expire(KEY, Duration.ofSeconds(2)))
+                .thenReturn(true);
+    }
+
+    public void increaseLimit(int amount) {
         int current = currentLimit.get();
-        int newLimit = current + 1;
+        int newLimit = current + amount;
         currentLimit.set(newLimit);
 
-        log.info("Sliding Window rate limit increased: {} -> {}", current, newLimit);
-
-        // 버킷 설정 갱신
-        refreshBucket();
+        log.info(" Rate limit increased: {} → {} (+{})", current, newLimit, amount);
     }
 
+    /**
+     * Rate Limit 감소 (amount만큼, 최대 30)
+     */
     public void decreaseLimit(int amount) {
         int current = currentLimit.get();
-        int newLimit = Math.max(10, current - amount);
+        int newLimit = Math.max(10, current - amount);  // 최소 10
         currentLimit.set(newLimit);
 
-        log.warn("Sliding Window rate limit decreased: {} -> {}", current, newLimit);
-
-        // 버킷 설정 갱신
-        refreshBucket();
-    }
-
-    private void refreshBucket() {
-        // ProxyManager를 통해 기존 버킷 제거
-        try {
-            proxyManager.removeProxy(BUCKET_KEY);
-            log.debug("Bucket configuration refreshed for key: {}", BUCKET_KEY);
-        } catch (Exception e) {
-            log.warn("Failed to remove old bucket, will be overwritten", e);
-        }
+        log.warn(" Rate limit decreased: {} → {} (-{})", current, newLimit, amount);
     }
 
     public int getCurrentLimit() {
@@ -100,10 +113,26 @@ public class GlobalRateLimiterService {
     }
 
     public Mono<Void> reset() {
-        return Mono.fromRunnable(() -> {
-            proxyManager.removeProxy(BUCKET_KEY);
-            currentLimit.set(30);
-            log.info("Rate limiter reset to default: 30 req/sec");
-        });
+        return reactiveRedisTemplate.delete(KEY)
+                .doOnSuccess(deleted -> {
+                    currentLimit.set(30);
+                    log.info(" Rate limiter reset");
+                })
+                .then();
+    }
+
+    public Mono<Boolean> isTokenSaturated() {
+        return getCurrentWindowCount()
+                .map(count -> {
+                    int max = getCurrentLimit();
+                    double usage = (double) count / max;
+
+                    boolean saturated = usage >= 0.9;
+                    log.debug("Token saturation: {}/{} ({:.1f}%)",
+                            count, max, usage * 100);
+
+                    return saturated;
+                })
+                .onErrorReturn(false);  // 에러 시 false 반환
     }
 }
