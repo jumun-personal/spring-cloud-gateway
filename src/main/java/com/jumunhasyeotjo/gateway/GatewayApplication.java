@@ -1,12 +1,17 @@
 package com.jumunhasyeotjo.gateway;
 
+import com.jumunhasyeotjo.gateway.ratelimiter.global.FeedbackLoopProperties;
 import jakarta.annotation.PostConstruct;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import reactor.core.publisher.Hooks;
 
 @SpringBootApplication(exclude = { SecurityAutoConfiguration.class })
+@EnableScheduling
+@EnableConfigurationProperties(FeedbackLoopProperties.class)
 public class GatewayApplication {
 
 	public static void main(String[] args) {
@@ -15,7 +20,6 @@ public class GatewayApplication {
 
 	@PostConstruct
 	public void init() {
-		// Reactor의 비동기 스레드 간에 MDC 정보를 자동으로 전파하도록 설정
 		Hooks.enableAutomaticContextPropagation();
 	}
 }

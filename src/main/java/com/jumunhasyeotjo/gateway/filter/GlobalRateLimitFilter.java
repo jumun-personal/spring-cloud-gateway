@@ -55,11 +55,16 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
         Long userId = extractUserId(exchange);
         String accessToken = extractAccessToken(exchange);
 
+        log.info("Adding to queue: userId={}", userId);
+
         return captureRequest(exchange)
+                .doOnNext(req -> log.info("Captured request: method={}, uri={}, bodyLen={}", 
+                        req.getMethod(), req.getUri(), req.getBody() != null ? req.getBody().length() : 0))
                 .flatMap(httpRequest -> {
                     QueueItem item = new QueueItem(userId, accessToken, httpRequest);
                     return queueService.offer(item);
                 })
+                .doOnNext(added -> log.info("Queue offer result: {}", added))
                 .flatMap(added -> queueService.findSequence(userId))
                 .flatMap(sequence -> {
                     ServerHttpResponse response = exchange.getResponse();
@@ -90,7 +95,7 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
         String token = exchange.getRequest().getHeaders().getFirst("Authorization");
 
         if (token == null || !token.startsWith("Bearer ")) {
-            return null;
+            return 0L;
         }
 
         try {

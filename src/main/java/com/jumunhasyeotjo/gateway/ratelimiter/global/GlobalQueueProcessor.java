@@ -1,4 +1,4 @@
-package com.jumunhasyeotjo.gateway.ratelimiter.pg;
+package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
 import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
@@ -10,6 +10,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
@@ -17,31 +18,48 @@ import java.net.URI;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class TokenRefillListener {
+public class GlobalQueueProcessor {
 
-    private final ReactiveRedisQueueService queueService;
-    private final ReactiveRateLimiterService rateLimiterService;
+    private final GlobalQueueService queueService;
+    private final GlobalRateLimiterService rateLimiterService;
     private final WebClient webClient;
 
     @Scheduled(fixedDelay = 100)
     public void processQueue() {
-        rateLimiterService.findAvailableProvider()
-                .flatMap(provider -> queueService.poll(1)
-                        .flatMap(items -> {
-                            if (items.isEmpty()) {
-                                return Mono.empty();
-                            }
-                            return executeQueuedRequest(items.get(0), provider);
-                        }))
-                .subscribe();
+        // 1. 가용 토큰 확인
+        rateLimiterService.getAvailableTokens()
+                .filter(tokens -> tokens > 0)
+                .flatMap(tokens -> {
+                    // 2. 토큰 수만큼 큐에서 꺼내기
+                    int batchSize = Math.min(tokens.intValue(), 10);
+                    return queueService.poll(batchSize);
+                })
+                .flatMapMany(Flux::fromIterable)
+                .flatMap(item -> 
+                    // 3. 토큰 소비 시도 후 요청 실행
+                    rateLimiterService.tryConsume()
+                            .flatMap(consumed -> {
+                                if (consumed) {
+                                    return executeRequest(item);
+                                }
+                                // 토큰 소진 시 다시 큐에
+                                log.debug("Token exhausted, re-queuing userId={}", item.getUserId());
+                                return queueService.offer(item).then();
+                            })
+                , 1) // concurrency 1로 순차 처리
+                .subscribe(
+                        null,
+                        e -> log.error("Queue processing error", e)
+                );
     }
 
-    private Mono<Void> executeQueuedRequest(QueueItem item, String provider) {
-        if (item == null || item.getHttpRequest() == null) {
+    private Mono<Void> executeRequest(QueueItem item) {
+        HttpRequestData request = item.getHttpRequest();
+        if (request == null) {
+            log.warn("Invalid request data for userId={}", item.getUserId());
             return Mono.empty();
         }
 
-        HttpRequestData request = item.getHttpRequest();
         String path = extractPath(request.getUri());
 
         return webClient
@@ -50,7 +68,6 @@ public class TokenRefillListener {
                         .scheme("lb")
                         .host("order-to-shipping-service")
                         .path(path)
-                        .queryParam("provider", provider)
                         .build())
                 .headers(headers -> {
                     headers.setContentType(MediaType.APPLICATION_JSON);
@@ -64,12 +81,10 @@ public class TokenRefillListener {
                 .body(request.getBody() != null ? BodyInserters.fromValue(request.getBody()) : BodyInserters.empty())
                 .retrieve()
                 .bodyToMono(String.class)
-                .doOnSuccess(r -> log.info("Processed with provider {} for userId={}", provider, item.getUserId()))
+                .doOnSuccess(r -> log.info("Processed queued request for userId={}", item.getUserId()))
+                .doOnError(e -> log.error("Request failed for userId={}: {}", item.getUserId(), e.getMessage()))
                 .then()
-                .onErrorResume(e -> {
-                    log.error("Request failed for userId={}", item.getUserId(), e);
-                    return Mono.empty();
-                });
+                .onErrorResume(e -> Mono.empty());
     }
 
     private String extractPath(String uri) {

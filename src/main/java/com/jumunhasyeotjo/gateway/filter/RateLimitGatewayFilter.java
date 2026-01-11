@@ -101,7 +101,7 @@ public class RateLimitGatewayFilter implements GlobalFilter, Ordered {
         String token = exchange.getRequest().getHeaders().getFirst("Authorization");
 
         if (token == null || !token.startsWith("Bearer ")) {
-            return null;
+            return 0L;
         }
 
         try {

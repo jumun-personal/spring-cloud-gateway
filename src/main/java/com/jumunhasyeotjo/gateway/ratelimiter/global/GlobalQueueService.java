@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -16,6 +17,7 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class GlobalQueueService {
 
     private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
@@ -73,6 +75,7 @@ public class GlobalQueueService {
     }
 
     private QueueItem deserialize(String json) {
+        log.info("QueueItem deserialize {} ", json);
         try {
             return objectMapper.readValue(json, QueueItem.class);
         } catch (JsonProcessingException e) {

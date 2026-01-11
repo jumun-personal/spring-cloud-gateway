@@ -63,8 +63,12 @@ public class FeedbackLoopScheduler {
                 String.format("%.1f", healthScore.getScore()),
                 healthScore.getLevel());
 
+        // UNKOWN 연결 오류
+        if(healthScore.getScore() == -1 ){
+            handleHealthyNoDemand();
+        }
         //  심각한 과부하 (Score < 30)
-        if (healthScore.getScore() < 30) {
+        else if (healthScore.getScore() < 30) {
             handleCriticalOverload(healthScore);
         }
         //  경미한 과부하 (Score < 60)
@@ -110,7 +114,7 @@ public class FeedbackLoopScheduler {
             lastAdjustmentTime = LocalDateTime.now();
             consecutiveOverloadCount.set(0);
 
-            log.warn("⬇️ CRITICAL: {} → {} (-{})",
+            log.warn("⬇ CRITICAL: {} → {} (-{})",
                     currentLimit, newLimit, actualDecrease);
         }
     }
@@ -227,6 +231,10 @@ public class FeedbackLoopScheduler {
         // 가중 평균
         double totalScore = (p95Score * 0.3) + (p99Score * 0.4) + (poolScore * 0.3);
 
+        if(p95Ms == 0.0 && p99Ms == 0.0 && connPool == 0.0){
+            return new SystemHealthScore(-1, p95Score, p99Score, poolScore);
+        }
+
         return new SystemHealthScore(totalScore, p95Score, p99Score, poolScore);
     }
 
@@ -262,6 +270,7 @@ public class FeedbackLoopScheduler {
             if (score >= 80) return "EXCELLENT";
             if (score >= 60) return "GOOD";
             if (score >= 30) return "DEGRADED";
+            if (score == -1) return "UNKNOWN";
             return "CRITICAL";
         }
     }
