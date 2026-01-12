@@ -14,11 +14,13 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.ConnectException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Duration;
 import java.util.concurrent.TimeoutException;
 
@@ -184,15 +186,17 @@ public class GlobalQueueProcessor {
         }
 
         String path = extractPath(request.getUri());
+        URI original = URI.create(request.getUri());
 
         return webClient
                 .method(HttpMethod.valueOf(request.getMethod()))
                 .uri(uriBuilder -> uriBuilder
                         .scheme("lb")
                         .host("order-to-shipping-service")
-                        .path(path)
+                        .path(original.getPath())
+                        .query(original.getQuery())
                         .queryParam("provider", DEFAULT_PROVIDER)
-                        .build())
+                        .build(true))
                 .headers(headers -> {
                     headers.setContentType(MediaType.APPLICATION_JSON);
                     if (request.getHeaders() != null) {
