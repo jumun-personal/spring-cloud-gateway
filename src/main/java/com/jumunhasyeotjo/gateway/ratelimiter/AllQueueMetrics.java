@@ -39,13 +39,13 @@ public class AllQueueMetrics {
         log.info("Initializing metrics for {} PG providers", paymentProviderRateLimiters.size());
 
         // 1. Global Queue - ORDER
-        Gauge.builder("queue.waiting.users.global", cachedGlobalOrderQueueSize, AtomicLong::get)
+        Gauge.builder("queue.waiting.users.global.order", cachedGlobalOrderQueueSize, AtomicLong::get)
                 .description("Number of users waiting in global ORDER queue")
                 .tag("type", "order")
                 .register(meterRegistry);
 
         // 2. Global Queue - OTHER
-        Gauge.builder("queue.waiting.users.global", cachedGlobalOtherQueueSize, AtomicLong::get)
+        Gauge.builder("queue.waiting.users.global.other", cachedGlobalOtherQueueSize, AtomicLong::get)
                 .description("Number of users waiting in global OTHER queue")
                 .tag("type", "other")
                 .register(meterRegistry);
@@ -78,7 +78,7 @@ public class AllQueueMetrics {
         for (PaymentProviderRateLimiter rateLimiter : paymentProviderRateLimiters) {
             String provider = rateLimiter.getProviderName();
 
-            Gauge.builder("rate.limit.pg.max", rateLimiter,
+            Gauge.builder("rate.limit.pg." + provider + ".max", rateLimiter,
                             PaymentProviderRateLimiter::getRateLimit)
                     .description("PG rate limit max tokens")
                     .tag("provider", provider)
@@ -86,14 +86,14 @@ public class AllQueueMetrics {
 
             cachedPgCurrentTokens.put(provider, new AtomicLong(0));
 
-            Gauge.builder("rate.limit.pg.current",
+            Gauge.builder("rate.limit.pg." + provider + ".current",
                             cachedPgCurrentTokens.get(provider),
                             AtomicLong::get)
                     .description("PG current available tokens")
                     .tag("provider", provider)
                     .register(meterRegistry);
 
-            Gauge.builder("rate.limit.pg.usage", this, metrics -> {
+            Gauge.builder("rate.limit.pg." + provider + ".usage", this, metrics -> {
                         long current = cachedPgCurrentTokens.get(provider).get();
                         int max = rateLimiter.getRateLimit();
                         return max > 0 ? (double) (max - current) / max * 100 : 0;
