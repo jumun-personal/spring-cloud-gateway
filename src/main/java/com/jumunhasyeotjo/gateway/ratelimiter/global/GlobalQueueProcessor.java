@@ -54,17 +54,19 @@ public class GlobalQueueProcessor {
     }
 
     private Mono<Void> processWithPgRateLimit(QueueItem item) {
-        String provider = "TOSS"; // TODO: 요청에서 provider 추출 또는 라운드로빈
+        String provider = "TOSS";
 
         return pgRateLimiterService.tryConsume(provider)
+                .doOnNext(hasToken -> log.info("PG tryConsume result: {}, userId={}", hasToken, item.getUserId()))
                 .flatMap(hasToken -> {
                     if (hasToken) {
                         log.info("PG token consumed, executing request for userId={}", item.getUserId());
                         return executeRequest(item, provider);
                     }
-                    // PG 토큰 없으면 PG 큐로
                     log.info("PG token exhausted, adding to PG queue userId={}", item.getUserId());
-                    return pgQueueService.offer(item).then();
+                    return pgQueueService.offer(item)
+                            .doOnNext(added -> log.info("PG queue offer result: {}, userId={}", added, item.getUserId()))
+                            .then();
                 });
     }
 
