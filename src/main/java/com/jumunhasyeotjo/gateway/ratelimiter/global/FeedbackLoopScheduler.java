@@ -63,9 +63,9 @@ public class FeedbackLoopScheduler {
                 String.format("%.1f", healthScore.getScore()),
                 healthScore.getLevel());
 
-        // UNKOWN 연결 오류
+        // UNKNOWN 연결 오류
         if(healthScore.getScore() == -1 ){
-            handleHealthyNoDemand();
+            handleUnknown();
         }
         //  심각한 과부하 (Score < 30)
         else if (healthScore.getScore() < 30) {
@@ -98,7 +98,7 @@ public class FeedbackLoopScheduler {
         if (overloadCount >= 2) {
             int currentLimit = rateLimiterService.getCurrentLimit();
 
-            //  감소량 계산 (25% 또는 최대 30)
+            //  감소량 계산
             int decrease = (int) (currentLimit * properties.getAdjustment().getDecreaseFactor());
             decrease = Math.min(decrease, properties.getAdjustment().getMaxDecrease());  // 최대 30
             decrease = Math.max(decrease, 5);  // 최소 5
@@ -200,13 +200,45 @@ public class FeedbackLoopScheduler {
     }
 
     /**
-     * 건강 + 수요 없음 → 유지
+     * UNKNOWN → 유지
      */
-    private void handleHealthyNoDemand() {
-        log.debug(" HEALTHY - No demand, maintaining limit: {}",
+    private void handleUnknown() {
+        log.debug(" UNKNOWN - maintaining limit: {}",
                 rateLimiterService.getCurrentLimit());
         consecutiveOverloadCount.set(0);
         consecutiveHealthyCount.set(0);
+    }
+
+    /**
+     * 건강 + 수요 없음 → 기본값까지 점진 감소
+     */
+    private void handleHealthyNoDemand() {
+        int currentLimit = rateLimiterService.getCurrentLimit();
+        int baseLimit = properties.getAdjustment().getMinLimit(); // 또는 minLimit
+
+        consecutiveOverloadCount.set(0);
+        consecutiveHealthyCount.set(0);
+
+        // 이미 기본값이면 유지
+        if (currentLimit <= baseLimit) {
+            log.debug(" HEALTHY - No demand, already at base limit: {}", currentLimit);
+            return;
+        }
+
+        // 20% 감소
+        int decrease = (int) (currentLimit * 0.20);
+        decrease = Math.max(decrease, 5); // 최소 5 보장
+
+        int newLimit = Math.max(currentLimit - decrease, baseLimit);
+        int actualDecrease = currentLimit - newLimit;
+
+        if (actualDecrease > 0) {
+            rateLimiterService.decreaseLimit(actualDecrease);
+            lastAdjustmentTime = LocalDateTime.now();
+
+            log.info("⬇ IDLE SCALE-IN: {} → {} (-{})",
+                    currentLimit, newLimit, actualDecrease);
+        }
     }
 
     /**

@@ -31,7 +31,7 @@ public class FeedbackLoopProperties {
         private double decreaseFactor = 0.25;    // 25%
         private int minLimit = 10;               // 최소 제한
         private int maxLimit = 1000;             // 최대 제한
-        private int maxDecrease = 30;            // 감소 최대값 (새로 추가!)
-        private int minIncrease = 1;             // 최소 증가량
+        private int maxDecrease = 15;            // 감소 최대값
+        private int minIncrease = 2;             // 최소 증가량
     }
 }
