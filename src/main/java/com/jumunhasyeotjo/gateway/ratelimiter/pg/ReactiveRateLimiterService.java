@@ -6,6 +6,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
@@ -53,5 +54,10 @@ public class ReactiveRateLimiterService {
     public int getRateLimit(String provider) {
         PaymentProviderRateLimiter rateLimiter = rateLimiterMap.get(provider.toUpperCase());
         return rateLimiter != null ? rateLimiter.getRateLimit() : 0;
+    }
+
+    public Mono<Long> getAvailableTokens(String provider) {
+        PaymentProviderRateLimiter rateLimiter = rateLimiterMap.get(provider.toUpperCase());
+        return rateLimiter.getAvailableTokens();
     }
 }

@@ -31,7 +31,7 @@ public class FeedbackLoopScheduler {
     @Scheduled(fixedDelayString = "${prometheus.scrape-interval:15}000")
     public void feedbackLoop() {
         metricsCollector.collectOrderServiceMetrics()
-                .zipWith(queueService.getQueueSize())
+                .zipWith(queueService.getTotalQueueSize())
                 .subscribe(tuple -> {
                     var metrics = tuple.getT1();
                     var queueSize = tuple.getT2();

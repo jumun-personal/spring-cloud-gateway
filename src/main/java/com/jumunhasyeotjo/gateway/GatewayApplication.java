@@ -1,6 +1,7 @@
 package com.jumunhasyeotjo.gateway;
 
 import com.jumunhasyeotjo.gateway.ratelimiter.global.FeedbackLoopProperties;
+import com.jumunhasyeotjo.gateway.ratelimiter.global.QueueWeightProperties;
 import jakarta.annotation.PostConstruct;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -11,7 +12,7 @@ import reactor.core.publisher.Hooks;
 
 @SpringBootApplication(exclude = { SecurityAutoConfiguration.class })
 @EnableScheduling
-@EnableConfigurationProperties(FeedbackLoopProperties.class)
+@EnableConfigurationProperties({FeedbackLoopProperties.class, QueueWeightProperties.class})
 public class GatewayApplication {
 
 	public static void main(String[] args) {

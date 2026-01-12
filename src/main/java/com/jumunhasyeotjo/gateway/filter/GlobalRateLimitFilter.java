@@ -1,9 +1,9 @@
 package com.jumunhasyeotjo.gateway.filter;
 
-
 import com.jumunhasyeotjo.gateway.jwt.JwtProvider;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService;
+import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalRateLimiterService;
 import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import io.jsonwebtoken.Claims;
@@ -39,7 +39,7 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         String path = exchange.getRequest().getURI().getPath();
 
-        // /api/v1/orders/bf만 체크
+        // /api/v1/orders만 체크
         if (!path.startsWith("/api/v1/orders")) {
             return chain.filter(exchange);
         }
@@ -59,28 +59,28 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
     private Mono<Void> addToGlobalQueue(ServerWebExchange exchange) {
         Long userId = extractUserId(exchange);
         String accessToken = extractAccessToken(exchange);
+        String uri = exchange.getRequest().getURI().toString();
+        QueueType queueType = queueService.resolveQueueType(uri);
 
-        log.info("Adding to queue: userId={}", userId);
+        log.info("Adding to {} queue: userId={}", queueType, userId);
 
         return captureRequest(exchange)
-                .doOnNext(req -> log.info("Captured request: method={}, uri={}, bodyLen={}", 
+                .doOnNext(req -> log.debug("Captured request: method={}, uri={}, bodyLen={}",
                         req.getMethod(), req.getUri(), req.getBody() != null ? req.getBody().length() : 0))
                 .flatMap(httpRequest -> {
                     QueueItem item = new QueueItem(userId, accessToken, httpRequest);
-                    return queueService.offer(item);
+                    return queueService.offer(item, queueType);
                 })
-                .doOnNext(added -> log.info("Queue offer result: {}", added))
-                .flatMap(added -> queueService.findSequence(userId))
+                .doOnNext(added -> log.debug("Queue offer result: {}", added))
+                .flatMap(added -> queueService.findSequence(userId, queueType))
                 .flatMap(sequence -> {
                     ServerHttpResponse response = exchange.getResponse();
                     response.setStatusCode(HttpStatus.ACCEPTED);
-
-                    // getHeaders()는 이미 mutable
                     response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
                     String body = String.format(
-                            "{\"status\":\"queued\",\"position\":%d,\"currentLimit\":%d,\"algorithm\":\"sliding-window\"}",
-                            sequence, rateLimiterService.getCurrentLimit()
+                            "{\"status\":\"queued\",\"queueType\":\"%s\",\"position\":%d,\"currentLimit\":%d}",
+                            queueType.name(), sequence, rateLimiterService.getCurrentLimit()
                     );
 
                     DataBuffer buffer = response.bufferFactory()
@@ -143,9 +143,8 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
                 ));
     }
 
-
     @Override
     public int getOrder() {
-        return -2; // PG Rate Limit보다 먼저 실행
+        return -2;
     }
 }

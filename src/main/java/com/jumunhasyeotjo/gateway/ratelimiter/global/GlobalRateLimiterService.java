@@ -21,7 +21,7 @@ public class GlobalRateLimiterService {
 
     private static final String KEY = "sliding:global:requests";
     private static final long WINDOW_SIZE_MS = 1000;
-    private final AtomicInteger currentLimit = new AtomicInteger(15);
+    private final AtomicInteger currentLimit = new AtomicInteger(30);
 
     // Lua 스크립트: 원자적으로 count 확인 + 추가
     private static final String LUA_SCRIPT = """
