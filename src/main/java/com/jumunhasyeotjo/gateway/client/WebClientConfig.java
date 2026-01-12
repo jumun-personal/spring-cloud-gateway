@@ -1,5 +1,6 @@
 package com.jumunhasyeotjo.gateway.client;
 
+import io.netty.channel.ChannelOption;
 import io.netty.handler.logging.LogLevel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,6 +14,8 @@ import org.springframework.web.util.DefaultUriBuilderFactory;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 import reactor.netty.transport.logging.AdvancedByteBufFormat;
+
+import java.time.Duration;
 
 
 @Configuration
@@ -35,7 +38,9 @@ public class WebClientConfig {
                         "reactor.netty.http.client.HttpClient",
                         LogLevel.INFO,
                         AdvancedByteBufFormat.TEXTUAL
-                );
+                )
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 20000)  // 연결 2초
+                .responseTimeout(Duration.ofSeconds(3));             // 응답 3초
 
         return builder
                 .clientConnector(new ReactorClientHttpConnector(httpClient))

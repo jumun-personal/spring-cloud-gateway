@@ -25,7 +25,7 @@ public class PrometheusMetricsCollector {
                         getP95Latency(),
                         getP99Latency(),
                         getConnectionPoolUsage()
-                ).doOnNext(tuple -> log.info("metric data found: {}", tuple.toString()))
+                ).doOnNext(tuple -> log.debug("metric data found: {}", tuple.toString()))
                 .map(tuple -> {
                     MetricsSnapshot snapshot = new MetricsSnapshot();
                     snapshot.setP95Latency(tuple.getT1());
@@ -57,7 +57,7 @@ public class PrometheusMetricsCollector {
     }
 
     private Mono<Double> queryPrometheus(String query) {
-        log.info("→ Querying Prometheus: {}", query.trim());
+        log.debug("→ Querying Prometheus: {}", query.trim());
 
         // 쿼리를 미리 인코딩
         String encodedQuery = UriUtils.encodeQueryParam(query, StandardCharsets.UTF_8);
@@ -68,7 +68,7 @@ public class PrometheusMetricsCollector {
                 .retrieve()
                 .bodyToMono(PrometheusResponse.class)
                 .doOnNext(response -> {
-                    log.info("← Prometheus Response: status={}, resultType={}, resultCount={}",
+                    log.debug("← Prometheus Response: status={}, resultType={}, resultCount={}",
                             response.getStatus(),
                             response.getData() != null ? response.getData().getResultType() : "null",
                             response.getData() != null && response.getData().getResult() != null
@@ -77,7 +77,7 @@ public class PrometheusMetricsCollector {
                     );
 
                     if (response.getData() != null && response.getData().getResult() != null) {
-                        log.info("← Full Response Data: {}", response.getData().getResult());
+                        log.debug("← Full Response Data: {}", response.getData().getResult());
                     }
                 })
                 .map(response -> {
@@ -86,7 +86,7 @@ public class PrometheusMetricsCollector {
                             && !response.getData().getResult().isEmpty()) {
 
                         String value = response.getData().getResult().get(0).getValue()[1].toString();
-                        log.info("Extracted value: {}", value);
+                        log.debug("Extracted value: {}", value);
                         return Double.parseDouble(value);
                     }
                     log.warn("Empty response for query: {}", query.trim());

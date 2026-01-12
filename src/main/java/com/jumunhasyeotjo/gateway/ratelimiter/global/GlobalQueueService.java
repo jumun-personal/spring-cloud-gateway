@@ -26,16 +26,20 @@ public class GlobalQueueService {
 
     private static final String ORDER_QUEUE_KEY = "queue:global:order";
     private static final String OTHER_QUEUE_KEY = "queue:global:other";
+    private static final String ORDER_RETRY_QUEUE_KEY = "queue:global:order:retry";
+    private static final String OTHER_RETRY_QUEUE_KEY = "queue:global:other:retry";
 
     @Getter
     public enum QueueType {
-        ORDER(ORDER_QUEUE_KEY),
-        OTHER(OTHER_QUEUE_KEY);
+        ORDER(ORDER_QUEUE_KEY, ORDER_RETRY_QUEUE_KEY),
+        OTHER(OTHER_QUEUE_KEY, OTHER_RETRY_QUEUE_KEY);
 
         private final String key;
+        private final String retryKey;
 
-        QueueType(String key) {
+        QueueType(String key, String retryKey) {
             this.key = key;
+            this.retryKey = retryKey;
         }
     }
 
@@ -49,23 +53,42 @@ public class GlobalQueueService {
     public Mono<Boolean> offer(QueueItem item, QueueType queueType) {
         return Mono.fromCallable(() -> objectMapper.writeValueAsString(item))
                 .flatMap(value -> {
-                    double score = System.currentTimeMillis();
+                    double score = item.getOriginalTimestamp();
                     return reactiveRedisTemplate.opsForZSet().add(queueType.getKey(), value, score);
                 })
                 .doOnNext(added -> log.debug("Queue offer [{}]: {}", queueType, added));
     }
 
+    public Mono<Boolean> offerToRetry(QueueItem item, QueueType queueType) {
+        return Mono.fromCallable(() -> objectMapper.writeValueAsString(item))
+                .flatMap(value -> {
+                    double score = item.getOriginalTimestamp();
+                    return reactiveRedisTemplate.opsForZSet().add(queueType.getRetryKey(), value, score);
+                })
+                .doOnNext(added -> log.debug("Retry queue offer [{}]: {}", queueType, added));
+    }
+
     public Mono<List<QueueItem>> poll(QueueType queueType, int size) {
-        if (size <= 0) {
-            return Mono.just(Collections.emptyList());
-        }
+        return pollFromKey(queueType.getKey(), size);
+    }
+
+    public Mono<List<QueueItem>> pollFromRetry(QueueType queueType, int size) {
+        return pollFromKey(queueType.getRetryKey(), size);
+    }
+
+    /**
+     * 재시도 큐에서 4초 이상 경과한 아이템만 조회
+     */
+    public Mono<List<QueueItem>> pollRetryEligible(QueueType queueType, int size) {
+        long threshold = System.currentTimeMillis() - 4000; // 4초 전
         
         return reactiveRedisTemplate.opsForZSet()
-                .range(queueType.getKey(), Range.closed(0L, (long) size - 1))
+                .rangeByScore(queueType.getRetryKey(), Range.closed(0.0, (double) threshold))
+                .take(size)
                 .collectList()
                 .flatMap(items -> {
                     if (items.isEmpty()) {
-                        return Mono.just(Collections.emptyList());
+                        return Mono.just(Collections.<QueueItem>emptyList());
                     }
 
                     List<QueueItem> result = items.stream()
@@ -73,7 +96,30 @@ public class GlobalQueueService {
                             .collect(Collectors.toList());
 
                     return reactiveRedisTemplate.opsForZSet()
-                            .remove(queueType.getKey(), items.toArray())
+                            .remove(queueType.getRetryKey(), items.toArray())
+                            .thenReturn(result);
+                });
+    }
+
+    private Mono<List<QueueItem>> pollFromKey(String key, int size) {
+        if (size <= 0) {
+            return Mono.just(Collections.emptyList());
+        }
+
+        return reactiveRedisTemplate.opsForZSet()
+                .range(key, Range.closed(0L, (long) size - 1))
+                .collectList()
+                .flatMap(items -> {
+                    if (items.isEmpty()) {
+                        return Mono.just(Collections.<QueueItem>emptyList());
+                    }
+
+                    List<QueueItem> result = items.stream()
+                            .map(this::deserialize)
+                            .collect(Collectors.toList());
+
+                    return reactiveRedisTemplate.opsForZSet()
+                            .remove(key, items.toArray())
                             .thenReturn(result);
                 });
     }
@@ -101,9 +147,31 @@ public class GlobalQueueService {
                 .defaultIfEmpty(0L);
     }
 
+    public Mono<Long> getRetryQueueSize(QueueType queueType) {
+        return reactiveRedisTemplate.opsForZSet()
+                .size(queueType.getRetryKey())
+                .defaultIfEmpty(0L);
+    }
+
+    /**
+     * 4초 이상 경과한 재시도 대기 아이템 수
+     */
+    public Mono<Long> getRetryEligibleCount(QueueType queueType) {
+        long threshold = System.currentTimeMillis() - 4000;
+        return reactiveRedisTemplate.opsForZSet()
+                .count(queueType.getRetryKey(), Range.closed(0.0, (double) threshold))
+                .defaultIfEmpty(0L);
+    }
+
     public Mono<Long> getTotalQueueSize() {
         return getQueueSize(QueueType.ORDER)
                 .zipWith(getQueueSize(QueueType.OTHER))
+                .map(tuple -> tuple.getT1() + tuple.getT2());
+    }
+
+    public Mono<Long> getTotalRetryQueueSize() {
+        return getRetryQueueSize(QueueType.ORDER)
+                .zipWith(getRetryQueueSize(QueueType.OTHER))
                 .map(tuple -> tuple.getT1() + tuple.getT2());
     }
 

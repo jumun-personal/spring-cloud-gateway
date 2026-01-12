@@ -28,9 +28,13 @@ public class AllQueueMetrics {
     private final List<PaymentProviderRateLimiter> paymentProviderRateLimiters;
     private final MeterRegistry meterRegistry;
 
-    // 캐시
+    // 캐시 - 일반 큐
     private final AtomicLong cachedGlobalOrderQueueSize = new AtomicLong(0);
     private final AtomicLong cachedGlobalOtherQueueSize = new AtomicLong(0);
+    // 캐시 - 재시도 큐
+    private final AtomicLong cachedOrderRetryQueueSize = new AtomicLong(0);
+    private final AtomicLong cachedOtherRetryQueueSize = new AtomicLong(0);
+    // 캐시 - Rate Limit
     private final AtomicLong cachedGlobalWindowCount = new AtomicLong(0);
     private final Map<String, AtomicLong> cachedPgCurrentTokens = new ConcurrentHashMap<>();
 
@@ -41,47 +45,51 @@ public class AllQueueMetrics {
         // 1. Global Queue - ORDER
         Gauge.builder("queue.waiting.users.global.order", cachedGlobalOrderQueueSize, AtomicLong::get)
                 .description("Number of users waiting in global ORDER queue")
-                .tag("type", "order")
                 .register(meterRegistry);
 
         // 2. Global Queue - OTHER
         Gauge.builder("queue.waiting.users.global.other", cachedGlobalOtherQueueSize, AtomicLong::get)
                 .description("Number of users waiting in global OTHER queue")
-                .tag("type", "other")
                 .register(meterRegistry);
 
-        // 3. Global Rate Limit - Max
+        // 3. Retry Queue - ORDER
+        Gauge.builder("queue.retry.order", cachedOrderRetryQueueSize, AtomicLong::get)
+                .description("Number of requests in ORDER retry queue")
+                .register(meterRegistry);
+
+        // 4. Retry Queue - OTHER
+        Gauge.builder("queue.retry.other", cachedOtherRetryQueueSize, AtomicLong::get)
+                .description("Number of requests in OTHER retry queue")
+                .register(meterRegistry);
+
+        // 5. Global Rate Limit - Max
         Gauge.builder("rate.limit.global.max", globalRateLimiterService,
                         GlobalRateLimiterService::getCurrentLimit)
                 .description("Global rate limit max (sliding window)")
-                .tag("type", "sliding-window")
                 .register(meterRegistry);
 
-        // 4. Global Rate Limit - Current Usage
+        // 6. Global Rate Limit - Current Usage
         Gauge.builder("rate.limit.global.current", cachedGlobalWindowCount, AtomicLong::get)
                 .description("Current requests in global sliding window")
-                .tag("type", "sliding-window")
                 .register(meterRegistry);
 
-        // 5. Global Rate Limit - Usage Ratio
+        // 7. Global Rate Limit - Usage Ratio
         Gauge.builder("rate.limit.global.usage", this, metrics -> {
                     long current = cachedGlobalWindowCount.get();
                     int max = globalRateLimiterService.getCurrentLimit();
                     return max > 0 ? (double) current / max * 100 : 0;
                 })
                 .description("Global rate limit usage percentage")
-                .tag("type", "sliding-window")
                 .baseUnit("percent")
                 .register(meterRegistry);
 
-        // 6. PG별 메트릭
+        // 8. PG별 메트릭
         for (PaymentProviderRateLimiter rateLimiter : paymentProviderRateLimiters) {
             String provider = rateLimiter.getProviderName();
 
             Gauge.builder("rate.limit.pg." + provider + ".max", rateLimiter,
                             PaymentProviderRateLimiter::getRateLimit)
                     .description("PG rate limit max tokens")
-                    .tag("provider", provider)
                     .register(meterRegistry);
 
             cachedPgCurrentTokens.put(provider, new AtomicLong(0));
@@ -90,7 +98,6 @@ public class AllQueueMetrics {
                             cachedPgCurrentTokens.get(provider),
                             AtomicLong::get)
                     .description("PG current available tokens")
-                    .tag("provider", provider)
                     .register(meterRegistry);
 
             Gauge.builder("rate.limit.pg." + provider + ".usage", this, metrics -> {
@@ -99,7 +106,6 @@ public class AllQueueMetrics {
                         return max > 0 ? (double) (max - current) / max * 100 : 0;
                     })
                     .description("PG rate limit usage percentage")
-                    .tag("provider", provider)
                     .baseUnit("percent")
                     .register(meterRegistry);
         }
@@ -115,7 +121,7 @@ public class AllQueueMetrics {
                 .subscribe(
                         size -> {
                             cachedGlobalOrderQueueSize.set(size);
-                            log.info("Global ORDER queue: {}", size);
+                            log.debug("Global ORDER queue: {}", size);
                         },
                         error -> log.warn("Failed to update global ORDER queue size: {}", error.getMessage())
                 );
@@ -126,9 +132,31 @@ public class AllQueueMetrics {
                 .subscribe(
                         size -> {
                             cachedGlobalOtherQueueSize.set(size);
-                            log.info("Global OTHER queue: {}", size);
+                            log.debug("Global OTHER queue: {}", size);
                         },
                         error -> log.warn("Failed to update global OTHER queue size: {}", error.getMessage())
+                );
+
+        // ORDER 재시도 큐
+        globalQueueService.getRetryQueueSize(QueueType.ORDER)
+                .timeout(Duration.ofSeconds(3))
+                .subscribe(
+                        size -> {
+                            cachedOrderRetryQueueSize.set(size);
+                            log.debug("ORDER retry queue: {}", size);
+                        },
+                        error -> log.warn("Failed to update ORDER retry queue size: {}", error.getMessage())
+                );
+
+        // OTHER 재시도 큐
+        globalQueueService.getRetryQueueSize(QueueType.OTHER)
+                .timeout(Duration.ofSeconds(3))
+                .subscribe(
+                        size -> {
+                            cachedOtherRetryQueueSize.set(size);
+                            log.debug("OTHER retry queue: {}", size);
+                        },
+                        error -> log.warn("Failed to update OTHER retry queue size: {}", error.getMessage())
                 );
     }
 
@@ -160,7 +188,7 @@ public class AllQueueMetrics {
                                 int max = rateLimiter.getRateLimit();
                                 long used = max - available;
                                 double usage = max > 0 ? (double) used / max * 100 : 0;
-                                log.info("PG {}: {}/{} used ({}%)", provider, used, max, String.format("%.1f", usage));
+                                log.debug("PG {}: {}/{} used ({}%)", provider, used, max, String.format("%.1f", usage));
                             },
                             error -> log.warn("Failed to get PG {} tokens: {}", provider, error.getMessage())
                     );

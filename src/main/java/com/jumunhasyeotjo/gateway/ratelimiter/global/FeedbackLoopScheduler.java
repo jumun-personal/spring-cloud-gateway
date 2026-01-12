@@ -28,7 +28,7 @@ public class FeedbackLoopScheduler {
     private final AtomicInteger consecutiveHealthyCount = new AtomicInteger(0);
     private LocalDateTime lastAdjustmentTime = LocalDateTime.now();
 
-    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:1}000")
+    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:2}00")
     public void feedbackLoop() {
         metricsCollector.collectOrderServiceMetrics()
                 .zipWith(queueService.getTotalQueueSize())
@@ -36,7 +36,7 @@ public class FeedbackLoopScheduler {
                     var metrics = tuple.getT1();
                     var queueSize = tuple.getT2();
 
-                    log.info(" Metrics - P95: {}ms, P99: {}ms, Pool: {}%, Queue: {}, Limit: {}",
+                    log.debug(" Metrics - P95: {}ms, P99: {}ms, Pool: {}%, Queue: {}, Limit: {}",
                             metrics.getP95Latency() * 1000,
                             metrics.getP99Latency() * 1000,
                             metrics.getConnectionPoolUsage(),
@@ -59,7 +59,7 @@ public class FeedbackLoopScheduler {
 
         SystemHealthScore healthScore = calculateHealthScore(p95Ms, p99Ms, connPool);
 
-        log.info(" Health Score: {}/100 ({})",
+        log.debug(" Health Score: {}/100 ({})",
                 String.format("%.1f", healthScore.getScore()),
                 healthScore.getLevel());
 
@@ -95,7 +95,7 @@ public class FeedbackLoopScheduler {
         int overloadCount = consecutiveOverloadCount.incrementAndGet();
         consecutiveHealthyCount.set(0);
 
-        if (overloadCount >= 2) {
+        if (overloadCount >= 5) {
             int currentLimit = rateLimiterService.getCurrentLimit();
 
             //  감소량 계산
@@ -129,7 +129,7 @@ public class FeedbackLoopScheduler {
         int overloadCount = consecutiveOverloadCount.incrementAndGet();
         consecutiveHealthyCount.set(0);
 
-        if (overloadCount >= 3 &&
+        if (overloadCount >= 5 &&
                 LocalDateTime.now().isAfter(lastAdjustmentTime.plusSeconds(scrapeInterval))) {
 
             int currentLimit = rateLimiterService.getCurrentLimit();
@@ -158,7 +158,7 @@ public class FeedbackLoopScheduler {
      * 건강 + 수요 있음 → 증가
      */
     private void handleHealthyWithDemand(Long queueSize) {
-        log.info(" HEALTHY with demand - Queue: {}", queueSize);
+        log.debug(" HEALTHY with demand - Queue: {}", queueSize);
 
         int healthyCount = consecutiveHealthyCount.incrementAndGet();
         consecutiveOverloadCount.set(0);
@@ -168,9 +168,9 @@ public class FeedbackLoopScheduler {
                     boolean hasRealDemand = saturated || queueSize > 5;
 
                     if (hasRealDemand &&
-                            healthyCount >= 2 &&
+                            healthyCount >= 29*5 &&
                             LocalDateTime.now().isAfter(
-                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 30L))) {
+                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 29L))) {
 
                         int currentLimit = rateLimiterService.getCurrentLimit();
 
@@ -190,7 +190,7 @@ public class FeedbackLoopScheduler {
                             lastAdjustmentTime = LocalDateTime.now();
                             consecutiveHealthyCount.set(0);
 
-                            log.info("️ HEALTHY: {} → {} (+{})",
+                            log.debug("️ HEALTHY: {} → {} (+{})",
                                     currentLimit, newLimit, actualIncrease);
                         }
                     }
@@ -236,7 +236,7 @@ public class FeedbackLoopScheduler {
             rateLimiterService.decreaseLimit(actualDecrease);
             lastAdjustmentTime = LocalDateTime.now();
 
-            log.info("⬇ IDLE SCALE-IN: {} → {} (-{})",
+            log.debug("⬇ IDLE SCALE-IN: {} → {} (-{})",
                     currentLimit, newLimit, actualDecrease);
         }
     }

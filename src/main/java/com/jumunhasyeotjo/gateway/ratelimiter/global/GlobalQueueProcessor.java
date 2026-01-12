@@ -4,6 +4,7 @@ import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
+import io.netty.channel.ConnectTimeoutException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpMethod;
@@ -11,11 +12,15 @@ import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.net.ConnectException;
 import java.net.URI;
+import java.time.Duration;
+import java.util.concurrent.TimeoutException;
 
 @Slf4j
 @Component
@@ -29,6 +34,7 @@ public class GlobalQueueProcessor {
     private final WebClient webClient;
 
     private static final String DEFAULT_PROVIDER = "TOSS";
+    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(15);
 
     @Scheduled(fixedDelay = 100)
     public void processQueue() {
@@ -37,11 +43,85 @@ public class GlobalQueueProcessor {
                 .flatMap(pgTokens -> globalRateLimiterService.getAvailableTokens()
                         .map(globalTokens -> Math.min(pgTokens.intValue(), globalTokens.intValue())))
                 .filter(availableSlots -> availableSlots > 0)
-                .flatMap(this::processWithDynamicWeight)
+                .flatMap(this::processQueues)
                 .subscribe(null, e -> log.error("Queue processing error", e));
     }
 
-    private Mono<Void> processWithDynamicWeight(int availableSlots) {
+    private Mono<Void> processQueues(int availableSlots) {
+        // 1. 재시도 큐 먼저 처리 (4초 경과한 것만)
+        return processRetryQueues(availableSlots)
+                .flatMap(remainingSlots -> {
+                    if (remainingSlots <= 0) {
+                        return Mono.empty();
+                    }
+                    // 2. 일반 큐 처리
+                    return processNormalQueues(remainingSlots);
+                });
+    }
+
+    /**
+     * 재시도 큐 처리 - 4초 이상 경과한 아이템만
+     * @return 남은 슬롯 수
+     */
+    private Mono<Integer> processRetryQueues(int availableSlots) {
+        return globalQueueService.getRetryEligibleCount(QueueType.ORDER)
+                .zipWith(globalQueueService.getRetryEligibleCount(QueueType.OTHER))
+                .flatMap(counts -> {
+                    int orderRetryCount = counts.getT1().intValue();
+                    int otherRetryCount = counts.getT2().intValue();
+                    int totalRetry = orderRetryCount + otherRetryCount;
+
+                    if (totalRetry == 0) {
+                        return Mono.just(availableSlots);
+                    }
+
+                    // 재시도 큐에서 가져올 수 있는 만큼 처리
+                    int retrySlots = Math.min(availableSlots, totalRetry);
+                    int orderRetrySlots = Math.min(orderRetryCount, retrySlots);
+                    int otherRetrySlots = Math.min(otherRetryCount, retrySlots - orderRetrySlots);
+
+                    log.info("Processing retry queues - orderRetry: {}, otherRetry: {}", 
+                            orderRetrySlots, otherRetrySlots);
+
+                    return processRetryQueueByType(QueueType.ORDER, orderRetrySlots)
+                            .then(processRetryQueueByType(QueueType.OTHER, otherRetrySlots))
+                            .thenReturn(availableSlots - orderRetrySlots - otherRetrySlots);
+                });
+    }
+
+    private Mono<Void> processRetryQueueByType(QueueType queueType, int count) {
+        if (count <= 0) {
+            return Mono.empty();
+        }
+
+        return globalQueueService.pollRetryEligible(queueType, count)
+                .flatMapMany(Flux::fromIterable)
+                .flatMap(item -> processRetryItem(item, queueType), 1)
+                .then();
+    }
+
+    private Mono<Void> processRetryItem(QueueItem item, QueueType queueType) {
+        return globalRateLimiterService.tryConsume()
+                .flatMap(globalOk -> {
+                    if (!globalOk) {
+                        log.debug("Global token exhausted for retry, re-queuing userId={}", item.getUserId());
+                        return globalQueueService.offerToRetry(item, queueType).then();
+                    }
+                    return pgRateLimiterService.tryConsume(DEFAULT_PROVIDER)
+                            .flatMap(pgOk -> {
+                                if (!pgOk) {
+                                    log.debug("PG token exhausted for retry, re-queuing userId={}", item.getUserId());
+                                    return globalQueueService.offerToRetry(item, queueType).then();
+                                }
+                                return executeRequest(item, queueType, true);
+                            });
+                });
+    }
+
+    /**
+     * 일반 큐 처리
+     */
+    private Mono<Void> processNormalQueues(int availableSlots) {
         return globalQueueService.getQueueSize(QueueType.ORDER)
                 .zipWith(globalQueueService.getQueueSize(QueueType.OTHER))
                 .flatMap(sizes -> {
@@ -52,7 +132,7 @@ public class GlobalQueueProcessor {
                     int orderSlots = slots[0];
                     int otherSlots = slots[1];
 
-                    log.debug("Processing - available: {}, orderQ: {}, otherQ: {}, orderSlots: {}, otherSlots: {}",
+                    log.debug("Processing normal - available: {}, orderQ: {}, otherQ: {}, orderSlots: {}, otherSlots: {}",
                             availableSlots, orderQueueSize, otherQueueSize, orderSlots, otherSlots);
 
                     return processQueueByType(QueueType.ORDER, orderSlots)
@@ -60,9 +140,6 @@ public class GlobalQueueProcessor {
                 });
     }
 
-    /**
-     * 동적 슬롯 분배
-     */
     private int[] calculateSlots(int availableSlots, int orderQueueSize, int otherQueueSize) {
         if (orderQueueSize == 0 && otherQueueSize == 0) {
             return new int[]{0, 0};
@@ -74,7 +151,6 @@ public class GlobalQueueProcessor {
             return new int[]{Math.min(availableSlots, orderQueueSize), 0};
         }
 
-        // 가중치 기반 기본 할당
         int orderWeight = weightProperties.getOrder();
         int otherWeight = weightProperties.getOther();
         int totalWeight = orderWeight + otherWeight;
@@ -82,11 +158,9 @@ public class GlobalQueueProcessor {
         int baseOrderSlots = (int) Math.ceil(availableSlots * (double) orderWeight / totalWeight);
         int baseOtherSlots = availableSlots - baseOrderSlots;
 
-        // 큐 크기에 맞게 조정 (큐에 있는 것보다 더 많이 가져갈 수 없음)
         int actualOrderSlots = Math.min(baseOrderSlots, orderQueueSize);
         int actualOtherSlots = Math.min(baseOtherSlots, otherQueueSize);
 
-        // 남는 슬롯 재분배
         int remainingSlots = availableSlots - actualOrderSlots - actualOtherSlots;
 
         if (remainingSlots > 0) {
@@ -131,12 +205,12 @@ public class GlobalQueueProcessor {
                                     log.debug("PG token exhausted, re-queuing userId={}", item.getUserId());
                                     return globalQueueService.offer(item, queueType).then();
                                 }
-                                return executeRequest(item);
+                                return executeRequest(item, queueType, false);
                             });
                 });
     }
 
-    private Mono<Void> executeRequest(QueueItem item) {
+    private Mono<Void> executeRequest(QueueItem item, QueueType queueType, boolean isRetry) {
         HttpRequestData request = item.getHttpRequest();
         if (request == null) {
             log.warn("Invalid request data for userId={}", item.getUserId());
@@ -164,11 +238,50 @@ public class GlobalQueueProcessor {
                 })
                 .body(request.getBody() != null ? BodyInserters.fromValue(request.getBody()) : BodyInserters.empty())
                 .retrieve()
+                .onStatus(status -> status.is5xxServerError(), 
+                        response -> Mono.error(new RuntimeException("Server error: " + response.statusCode())))
                 .bodyToMono(String.class)
-                .doOnSuccess(r -> log.info("Processed {} request for userId={}", DEFAULT_PROVIDER, item.getUserId()))
-                .doOnError(e -> log.error("Request failed for userId={}: {}", item.getUserId(), e.getMessage()))
+                .timeout(REQUEST_TIMEOUT)
+                .doOnSuccess(r -> log.info("Processed {} request for userId={}, isRetry={}", 
+                        DEFAULT_PROVIDER, item.getUserId(), isRetry))
                 .then()
-                .onErrorResume(e -> Mono.empty());
+                .onErrorResume(e -> handleRequestError(e, item, queueType, isRetry));
+    }
+
+    private Mono<Void> handleRequestError(Throwable e, QueueItem item, QueueType queueType, boolean isRetry) {
+        log.error("Request failed for userId={}, isRetry={}, error={}", 
+                item.getUserId(), isRetry, e.getMessage());
+
+        // 이미 재시도한 건 폐기
+        if (isRetry) {
+            log.error("Retry also failed, dropping request for userId={}", item.getUserId());
+            return Mono.empty();
+        }
+
+        // 재시도 가능한 에러인지 확인
+        if (isRetryable(e) && item.canRetry()) {
+            item.incrementRetryCount();
+            log.warn("Retryable error, moving to retry queue userId={}", item.getUserId());
+            return globalQueueService.offerToRetry(item, queueType).then();
+        }
+
+        log.error("Non-retryable error or max retry exceeded, dropping userId={}", item.getUserId());
+        return Mono.empty();
+    }
+
+    private boolean isRetryable(Throwable e) {
+        if (e instanceof TimeoutException) return true;
+        if (e instanceof ConnectException) return true;
+        if (e instanceof ConnectTimeoutException) return true;
+        if (e instanceof WebClientRequestException) return true;
+        // 5xx 서버 에러 (RuntimeException으로 래핑됨)
+        if (e instanceof RuntimeException && e.getMessage() != null 
+                && e.getMessage().contains("Server error")) return true;
+        
+        if (e.getCause() != null) {
+            return isRetryable(e.getCause());
+        }
+        return false;
     }
 
     private String extractPath(String uri) {
