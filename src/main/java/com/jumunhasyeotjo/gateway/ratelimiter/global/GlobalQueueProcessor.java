@@ -43,112 +43,82 @@ public class GlobalQueueProcessor {
                 .flatMap(pgTokens -> globalRateLimiterService.getAvailableTokens()
                         .map(globalTokens -> Math.min(pgTokens.intValue(), globalTokens.intValue())))
                 .filter(availableSlots -> availableSlots > 0)
-                .flatMap(this::processQueues)
+                .flatMap(this::processWithDynamicWeight)
                 .subscribe(null, e -> log.error("Queue processing error", e));
     }
 
-    private Mono<Void> processQueues(int availableSlots) {
-        // 1. 재시도 큐 먼저 처리 (4초 경과한 것만)
-        return processRetryQueues(availableSlots)
-                .flatMap(remainingSlots -> {
-                    if (remainingSlots <= 0) {
-                        return Mono.empty();
-                    }
-                    // 2. 일반 큐 처리
-                    return processNormalQueues(remainingSlots);
-                });
+    private Mono<Void> processWithDynamicWeight(int availableSlots) {
+        // 1. 모든 큐 사이즈 조회
+        return Mono.zip(
+                globalQueueService.getQueueSize(QueueType.ORDER),
+                globalQueueService.getQueueSize(QueueType.OTHER),
+                globalQueueService.getRetryEligibleCount(QueueType.ORDER),
+                globalQueueService.getRetryEligibleCount(QueueType.OTHER)
+        ).flatMap(tuple -> {
+            int orderQueueSize = tuple.getT1().intValue();
+            int otherQueueSize = tuple.getT2().intValue();
+            int orderRetrySize = tuple.getT3().intValue();
+            int otherRetrySize = tuple.getT4().intValue();
+
+            // 2. 가중치로 ORDER/OTHER 슬롯 분배
+            int[] slots = calculateSlots(availableSlots, 
+                    orderQueueSize + orderRetrySize, 
+                    otherQueueSize + otherRetrySize);
+            int orderSlots = slots[0];
+            int otherSlots = slots[1];
+
+            // 3. 각 타입 내에서 retry 우선 처리
+            int orderRetrySlots = Math.min(orderSlots, orderRetrySize);
+            int orderNormalSlots = orderSlots - orderRetrySlots;
+
+            int otherRetrySlots = Math.min(otherSlots, otherRetrySize);
+            int otherNormalSlots = otherSlots - otherRetrySlots;
+
+            log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
+                    orderRetrySlots, orderNormalSlots, otherRetrySlots, otherNormalSlots);
+
+            // 4. 처리 실행
+            return processQueueType(QueueType.ORDER, orderRetrySlots, orderNormalSlots)
+                    .then(processQueueType(QueueType.OTHER, otherRetrySlots, otherNormalSlots));
+        });
     }
 
-    /**
-     * 재시도 큐 처리 - 4초 이상 경과한 아이템만
-     * @return 남은 슬롯 수
-     */
-    private Mono<Integer> processRetryQueues(int availableSlots) {
-        return globalQueueService.getRetryEligibleCount(QueueType.ORDER)
-                .zipWith(globalQueueService.getRetryEligibleCount(QueueType.OTHER))
-                .flatMap(counts -> {
-                    int orderRetryCount = counts.getT1().intValue();
-                    int otherRetryCount = counts.getT2().intValue();
-                    int totalRetry = orderRetryCount + otherRetryCount;
-
-                    if (totalRetry == 0) {
-                        return Mono.just(availableSlots);
-                    }
-
-                    // 재시도 큐에서 가져올 수 있는 만큼 처리
-                    int retrySlots = Math.min(availableSlots, totalRetry);
-                    int orderRetrySlots = Math.min(orderRetryCount, retrySlots);
-                    int otherRetrySlots = Math.min(otherRetryCount, retrySlots - orderRetrySlots);
-
-                    log.info("Processing retry queues - orderRetry: {}, otherRetry: {}", 
-                            orderRetrySlots, otherRetrySlots);
-
-                    return processRetryQueueByType(QueueType.ORDER, orderRetrySlots)
-                            .then(processRetryQueueByType(QueueType.OTHER, otherRetrySlots))
-                            .thenReturn(availableSlots - orderRetrySlots - otherRetrySlots);
-                });
+    private Mono<Void> processQueueType(QueueType queueType, int retrySlots, int normalSlots) {
+        return processRetryQueue(queueType, retrySlots)
+                .then(processNormalQueue(queueType, normalSlots));
     }
 
-    private Mono<Void> processRetryQueueByType(QueueType queueType, int count) {
+    private Mono<Void> processRetryQueue(QueueType queueType, int count) {
         if (count <= 0) {
             return Mono.empty();
         }
 
         return globalQueueService.pollRetryEligible(queueType, count)
                 .flatMapMany(Flux::fromIterable)
-                .flatMap(item -> processRetryItem(item, queueType), 1)
+                .flatMap(item -> processItem(item, queueType, true), 1)
                 .then();
     }
 
-    private Mono<Void> processRetryItem(QueueItem item, QueueType queueType) {
-        return globalRateLimiterService.tryConsume()
-                .flatMap(globalOk -> {
-                    if (!globalOk) {
-                        log.debug("Global token exhausted for retry, re-queuing userId={}", item.getUserId());
-                        return globalQueueService.offerToRetry(item, queueType).then();
-                    }
-                    return pgRateLimiterService.tryConsume(DEFAULT_PROVIDER)
-                            .flatMap(pgOk -> {
-                                if (!pgOk) {
-                                    log.debug("PG token exhausted for retry, re-queuing userId={}", item.getUserId());
-                                    return globalQueueService.offerToRetry(item, queueType).then();
-                                }
-                                return executeRequest(item, queueType, true);
-                            });
-                });
+    private Mono<Void> processNormalQueue(QueueType queueType, int count) {
+        if (count <= 0) {
+            return Mono.empty();
+        }
+
+        return globalQueueService.poll(queueType, count)
+                .flatMapMany(Flux::fromIterable)
+                .flatMap(item -> processItem(item, queueType, false), 1)
+                .then();
     }
 
-    /**
-     * 일반 큐 처리
-     */
-    private Mono<Void> processNormalQueues(int availableSlots) {
-        return globalQueueService.getQueueSize(QueueType.ORDER)
-                .zipWith(globalQueueService.getQueueSize(QueueType.OTHER))
-                .flatMap(sizes -> {
-                    int orderQueueSize = sizes.getT1().intValue();
-                    int otherQueueSize = sizes.getT2().intValue();
-
-                    int[] slots = calculateSlots(availableSlots, orderQueueSize, otherQueueSize);
-                    int orderSlots = slots[0];
-                    int otherSlots = slots[1];
-
-                    log.debug("Processing normal - available: {}, orderQ: {}, otherQ: {}, orderSlots: {}, otherSlots: {}",
-                            availableSlots, orderQueueSize, otherQueueSize, orderSlots, otherSlots);
-
-                    return processQueueByType(QueueType.ORDER, orderSlots)
-                            .then(processQueueByType(QueueType.OTHER, otherSlots));
-                });
-    }
-
-    private int[] calculateSlots(int availableSlots, int orderQueueSize, int otherQueueSize) {
-        if (orderQueueSize == 0 && otherQueueSize == 0) {
+    private int[] calculateSlots(int availableSlots, int orderTotal, int otherTotal) {
+        if (orderTotal == 0 && otherTotal == 0) {
             return new int[]{0, 0};
         }
-        if (orderQueueSize == 0) {
-            return new int[]{0, Math.min(availableSlots, otherQueueSize)};
+        if (orderTotal == 0) {
+            return new int[]{0, Math.min(availableSlots, otherTotal)};
         }
-        if (otherQueueSize == 0) {
-            return new int[]{Math.min(availableSlots, orderQueueSize), 0};
+        if (otherTotal == 0) {
+            return new int[]{Math.min(availableSlots, orderTotal), 0};
         }
 
         int orderWeight = weightProperties.getOrder();
@@ -158,14 +128,14 @@ public class GlobalQueueProcessor {
         int baseOrderSlots = (int) Math.ceil(availableSlots * (double) orderWeight / totalWeight);
         int baseOtherSlots = availableSlots - baseOrderSlots;
 
-        int actualOrderSlots = Math.min(baseOrderSlots, orderQueueSize);
-        int actualOtherSlots = Math.min(baseOtherSlots, otherQueueSize);
+        int actualOrderSlots = Math.min(baseOrderSlots, orderTotal);
+        int actualOtherSlots = Math.min(baseOtherSlots, otherTotal);
 
         int remainingSlots = availableSlots - actualOrderSlots - actualOtherSlots;
 
         if (remainingSlots > 0) {
-            int orderCanTakeMore = orderQueueSize - actualOrderSlots;
-            int otherCanTakeMore = otherQueueSize - actualOtherSlots;
+            int orderCanTakeMore = orderTotal - actualOrderSlots;
+            int otherCanTakeMore = otherTotal - actualOtherSlots;
 
             if (orderCanTakeMore > 0) {
                 int extra = Math.min(remainingSlots, orderCanTakeMore);
@@ -181,33 +151,29 @@ public class GlobalQueueProcessor {
         return new int[]{actualOrderSlots, actualOtherSlots};
     }
 
-    private Mono<Void> processQueueByType(QueueType queueType, int count) {
-        if (count <= 0) {
-            return Mono.empty();
-        }
-
-        return globalQueueService.poll(queueType, count)
-                .flatMapMany(Flux::fromIterable)
-                .flatMap(item -> processItem(item, queueType), 1)
-                .then();
-    }
-
-    private Mono<Void> processItem(QueueItem item, QueueType queueType) {
+    private Mono<Void> processItem(QueueItem item, QueueType queueType, boolean isRetry) {
         return globalRateLimiterService.tryConsume()
                 .flatMap(globalOk -> {
                     if (!globalOk) {
                         log.debug("Global token exhausted, re-queuing userId={}", item.getUserId());
-                        return globalQueueService.offer(item, queueType).then();
+                        return requeue(item, queueType, isRetry);
                     }
                     return pgRateLimiterService.tryConsume(DEFAULT_PROVIDER)
                             .flatMap(pgOk -> {
                                 if (!pgOk) {
                                     log.debug("PG token exhausted, re-queuing userId={}", item.getUserId());
-                                    return globalQueueService.offer(item, queueType).then();
+                                    return requeue(item, queueType, isRetry);
                                 }
-                                return executeRequest(item, queueType, false);
+                                return executeRequest(item, queueType, isRetry);
                             });
                 });
+    }
+
+    private Mono<Void> requeue(QueueItem item, QueueType queueType, boolean wasRetry) {
+        if (wasRetry) {
+            return globalQueueService.offerToRetry(item, queueType).then();
+        }
+        return globalQueueService.offer(item, queueType).then();
     }
 
     private Mono<Void> executeRequest(QueueItem item, QueueType queueType, boolean isRetry) {
@@ -238,23 +204,23 @@ public class GlobalQueueProcessor {
                 })
                 .body(request.getBody() != null ? BodyInserters.fromValue(request.getBody()) : BodyInserters.empty())
                 .retrieve()
-                .onStatus(status -> status.is5xxServerError(), 
+                .onStatus(status -> status.is5xxServerError(),
                         response -> Mono.error(new RuntimeException("Server error: " + response.statusCode())))
                 .bodyToMono(String.class)
                 .timeout(REQUEST_TIMEOUT)
-                .doOnSuccess(r -> log.info("Processed {} request for userId={}, isRetry={}", 
+                .doOnSuccess(r -> log.info("Processed {} request for userId={}, isRetry={}",
                         DEFAULT_PROVIDER, item.getUserId(), isRetry))
                 .then()
                 .onErrorResume(e -> handleRequestError(e, item, queueType, isRetry));
     }
 
     private Mono<Void> handleRequestError(Throwable e, QueueItem item, QueueType queueType, boolean isRetry) {
-        log.error("Request failed for userId={}, isRetry={}, error={}", 
+        log.error("Request failed for userId={}, isRetry={}, error={}",
                 item.getUserId(), isRetry, e.getMessage());
 
         // 이미 재시도한 건 폐기
         if (isRetry) {
-            log.error("Retry also failed, dropping request for userId={}", item.getUserId());
+            log.error("Retry failed, dropping request for userId={}", item.getUserId());
             return Mono.empty();
         }
 
@@ -265,7 +231,7 @@ public class GlobalQueueProcessor {
             return globalQueueService.offerToRetry(item, queueType).then();
         }
 
-        log.error("Non-retryable error or max retry exceeded, dropping userId={}", item.getUserId());
+        log.error("Non-retryable error, dropping userId={}", item.getUserId());
         return Mono.empty();
     }
 
@@ -274,10 +240,9 @@ public class GlobalQueueProcessor {
         if (e instanceof ConnectException) return true;
         if (e instanceof ConnectTimeoutException) return true;
         if (e instanceof WebClientRequestException) return true;
-        // 5xx 서버 에러 (RuntimeException으로 래핑됨)
-        if (e instanceof RuntimeException && e.getMessage() != null 
+        if (e instanceof RuntimeException && e.getMessage() != null
                 && e.getMessage().contains("Server error")) return true;
-        
+
         if (e.getCause() != null) {
             return isRetryable(e.getCause());
         }
