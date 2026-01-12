@@ -156,7 +156,7 @@ public class AllQueueMetrics {
                             int limit = globalRateLimiterService.getCurrentLimit();
                             double usage = limit > 0 ? (double) count / limit * 100 : 0;
 
-                            log.info(" Global: {}/{} ({:.1f}%)", count, limit, usage);
+                            log.info(" Global: {}/{} ({}%)", count, limit, String.format("%.1f", usage));
                         },
                         error -> log.warn("Failed to update global window count: {}", error.getMessage())
                 );
@@ -179,8 +179,8 @@ public class AllQueueMetrics {
                                 long used = max - available;
                                 double usage = max > 0 ? (double) used / max * 100 : 0;
 
-                                log.info(" PG {}: {}/{} used ({:.1f}%)",
-                                        provider, used, max, usage);
+                                log.info(" PG {}: {}/{} used ({}%)",
+                                        provider, used, max, String.format("%.1f", usage));
                             },
                             error -> log.warn("Failed to get PG {} tokens: {}",
                                     provider, error.getMessage())
