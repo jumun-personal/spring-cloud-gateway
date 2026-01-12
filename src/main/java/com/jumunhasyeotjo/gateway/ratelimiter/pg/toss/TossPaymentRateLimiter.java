@@ -17,7 +17,7 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
 
     private final ProxyManager<String> proxyManager;
     private static final String BUCKET_KEY = "bucket:toss";
-    private static final int RATE_LIMIT = 10;
+    private static final int RATE_LIMIT = 20;
 
     @Override
     public Mono<Boolean> tryConsume() {
