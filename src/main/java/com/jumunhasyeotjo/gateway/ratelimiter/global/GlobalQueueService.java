@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -38,8 +39,8 @@ public class GlobalQueueService {
         }
     }
 
-    public QueueType resolveQueueType(String uri) {
-        if (uri != null && uri.contains("/orders")) {
+    public QueueType resolveQueueType(HttpMethod method, String uri) {
+        if (uri != null && uri.contains("/orders") && method.equals(HttpMethod.POST)) {
             return QueueType.ORDER;
         }
         return QueueType.OTHER;
@@ -52,12 +53,6 @@ public class GlobalQueueService {
                     return reactiveRedisTemplate.opsForZSet().add(queueType.getKey(), value, score);
                 })
                 .doOnNext(added -> log.debug("Queue offer [{}]: {}", queueType, added));
-    }
-
-    public Mono<Boolean> offer(QueueItem item) {
-        String uri = item.getHttpRequest() != null ? item.getHttpRequest().getUri() : null;
-        QueueType queueType = resolveQueueType(uri);
-        return offer(item, queueType);
     }
 
     public Mono<List<QueueItem>> poll(QueueType queueType, int size) {
