@@ -21,14 +21,14 @@ public class FeedbackLoopScheduler {
     private final GlobalQueueService queueService;
     private final FeedbackLoopProperties properties;
 
-    @Value("${prometheus.scrape-interval:30}")
+    @Value("${prometheus.scrape-interval:1}")
     private int scrapeInterval;
 
     private final AtomicInteger consecutiveOverloadCount = new AtomicInteger(0);
     private final AtomicInteger consecutiveHealthyCount = new AtomicInteger(0);
     private LocalDateTime lastAdjustmentTime = LocalDateTime.now();
 
-    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:30}000")
+    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:1}000")
     public void feedbackLoop() {
         metricsCollector.collectOrderServiceMetrics()
                 .zipWith(queueService.getTotalQueueSize())
@@ -71,8 +71,8 @@ public class FeedbackLoopScheduler {
         else if (healthScore.getScore() < 30) {
             handleCriticalOverload(healthScore);
         }
-        //  경미한 과부하 (Score < 60)
-        else if (healthScore.getScore() < 60) {
+        //  경미한 과부하 (Score < 80)
+        else if (healthScore.getScore() < 80) {
             handleModerateOverload(healthScore);
         }
         //  건강 상태 (Score >= 80) + 수요 있음
@@ -101,7 +101,7 @@ public class FeedbackLoopScheduler {
             //  감소량 계산
             int decrease = (int) (currentLimit * properties.getAdjustment().getDecreaseFactor());
             decrease = Math.min(decrease, properties.getAdjustment().getMaxDecrease());  // 최대 30
-            decrease = Math.max(decrease, 5);  // 최소 5
+            decrease = Math.max(decrease, 10);  // 최소 5
 
             // 최소 제한 확인
             int newLimit = Math.max(
@@ -120,7 +120,7 @@ public class FeedbackLoopScheduler {
     }
 
     /**
-     * 경미한 과부하 처리 (Score < 60)
+     * 경미한 과부하 처리 (Score < 80)
      */
     private void handleModerateOverload(SystemHealthScore score) {
         log.warn(" MODERATE OVERLOAD - Score: {}/100",
@@ -136,7 +136,7 @@ public class FeedbackLoopScheduler {
 
             //  감소량 계산 (10% 또는 최대 30)
             int decrease = (int) (currentLimit * 0.10);
-            decrease = Math.min(decrease, properties.getAdjustment().getMaxDecrease());  // 최대 30
+            decrease = Math.min(decrease, properties.getAdjustment().getMaxDecrease());
             decrease = Math.max(decrease, 3);  // 최소 3
 
             int newLimit = Math.max(
@@ -170,7 +170,7 @@ public class FeedbackLoopScheduler {
                     if (hasRealDemand &&
                             healthyCount >= 2 &&
                             LocalDateTime.now().isAfter(
-                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 2L))) {
+                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 30L))) {
 
                         int currentLimit = rateLimiterService.getCurrentLimit();
 
