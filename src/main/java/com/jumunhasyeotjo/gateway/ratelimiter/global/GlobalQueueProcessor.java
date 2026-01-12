@@ -2,6 +2,8 @@ package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
 import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
+import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
+import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRedisQueueService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpMethod;
@@ -20,40 +22,53 @@ import java.net.URI;
 @RequiredArgsConstructor
 public class GlobalQueueProcessor {
 
-    private final GlobalQueueService queueService;
-    private final GlobalRateLimiterService rateLimiterService;
+    private final GlobalQueueService globalQueueService;
+    private final GlobalRateLimiterService globalRateLimiterService;
+    private final ReactiveRateLimiterService pgRateLimiterService;
+    private final ReactiveRedisQueueService pgQueueService;
     private final WebClient webClient;
 
     @Scheduled(fixedDelay = 100)
     public void processQueue() {
-        // 1. 가용 토큰 확인
-        rateLimiterService.getAvailableTokens()
+        globalRateLimiterService.getAvailableTokens()
                 .filter(tokens -> tokens > 0)
                 .flatMap(tokens -> {
-                    // 2. 토큰 수만큼 큐에서 꺼내기
                     int batchSize = Math.min(tokens.intValue(), 10);
-                    return queueService.poll(batchSize);
+                    return globalQueueService.poll(batchSize);
                 })
                 .flatMapMany(Flux::fromIterable)
-                .flatMap(item -> 
-                    // 3. 토큰 소비 시도 후 요청 실행
-                    rateLimiterService.tryConsume()
+                .flatMap(item ->
+                    globalRateLimiterService.tryConsume()
                             .flatMap(consumed -> {
                                 if (consumed) {
-                                    return executeRequest(item);
+                                    return processWithPgRateLimit(item);
                                 }
-                                // 토큰 소진 시 다시 큐에
-                                log.debug("Token exhausted, re-queuing userId={}", item.getUserId());
-                                return queueService.offer(item).then();
+                                log.debug("Global token exhausted, re-queuing userId={}", item.getUserId());
+                                return globalQueueService.offer(item).then();
                             })
-                , 1) // concurrency 1로 순차 처리
+                , 1)
                 .subscribe(
                         null,
                         e -> log.error("Queue processing error", e)
                 );
     }
 
-    private Mono<Void> executeRequest(QueueItem item) {
+    private Mono<Void> processWithPgRateLimit(QueueItem item) {
+        String provider = "TOSS"; // TODO: 요청에서 provider 추출 또는 라운드로빈
+
+        return pgRateLimiterService.tryConsume(provider)
+                .flatMap(hasToken -> {
+                    if (hasToken) {
+                        log.info("PG token consumed, executing request for userId={}", item.getUserId());
+                        return executeRequest(item, provider);
+                    }
+                    // PG 토큰 없으면 PG 큐로
+                    log.info("PG token exhausted, adding to PG queue userId={}", item.getUserId());
+                    return pgQueueService.offer(item).then();
+                });
+    }
+
+    private Mono<Void> executeRequest(QueueItem item, String provider) {
         HttpRequestData request = item.getHttpRequest();
         if (request == null) {
             log.warn("Invalid request data for userId={}", item.getUserId());
@@ -68,6 +83,7 @@ public class GlobalQueueProcessor {
                         .scheme("lb")
                         .host("order-to-shipping-service")
                         .path(path)
+                        .queryParam("provider", provider)
                         .build())
                 .headers(headers -> {
                     headers.setContentType(MediaType.APPLICATION_JSON);
@@ -81,7 +97,7 @@ public class GlobalQueueProcessor {
                 .body(request.getBody() != null ? BodyInserters.fromValue(request.getBody()) : BodyInserters.empty())
                 .retrieve()
                 .bodyToMono(String.class)
-                .doOnSuccess(r -> log.info("Processed queued request for userId={}", item.getUserId()))
+                .doOnSuccess(r -> log.info("Processed request with provider {} for userId={}", provider, item.getUserId()))
                 .doOnError(e -> log.error("Request failed for userId={}: {}", item.getUserId(), e.getMessage()))
                 .then()
                 .onErrorResume(e -> Mono.empty());
