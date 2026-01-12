@@ -7,5 +7,5 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 @EnableConfigurationProperties(FeedbackLoopProperties.class)
 public class FeedbackLoopConfig {
-    // 다른 빈 설정이 있다면 여기에
+
 }

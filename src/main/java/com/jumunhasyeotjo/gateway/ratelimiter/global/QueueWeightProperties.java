@@ -7,8 +7,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @Data
 public class QueueWeightProperties {
     
-    private int order = 6;   // ORDER 가중치 (기본값 6)
-    private int other = 4;   // OTHER 가중치 (기본값 4)
+    private int order = 7;   // ORDER 가중치 (기본값 6)
+    private int other = 3;   // OTHER 가중치 (기본값 4)
     
     public int getTotal() {
         return order + other;

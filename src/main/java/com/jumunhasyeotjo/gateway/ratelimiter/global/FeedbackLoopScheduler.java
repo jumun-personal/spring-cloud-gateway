@@ -28,26 +28,26 @@ public class FeedbackLoopScheduler {
     private final AtomicInteger consecutiveHealthyCount = new AtomicInteger(0);
     private LocalDateTime lastAdjustmentTime = LocalDateTime.now();
 
-    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:2}00")
-    public void feedbackLoop() {
-        metricsCollector.collectOrderServiceMetrics()
-                .zipWith(queueService.getTotalQueueSize())
-                .subscribe(tuple -> {
-                    var metrics = tuple.getT1();
-                    var queueSize = tuple.getT2();
-
-                    log.debug(" Metrics - P95: {}ms, P99: {}ms, Pool: {}%, Queue: {}, Limit: {}",
-                            metrics.getP95Latency() * 1000,
-                            metrics.getP99Latency() * 1000,
-                            metrics.getConnectionPoolUsage(),
-                            queueSize,
-                            rateLimiterService.getCurrentLimit());
-
-                    evaluateAndAdjust(metrics, queueSize);
-                }, error -> {
-                    log.error("Failed to collect metrics", error);
-                });
-    }
+//    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:2}00")
+//    public void feedbackLoop() {
+//        metricsCollector.collectOrderServiceMetrics()
+//                .zipWith(queueService.getTotalQueueSize())
+//                .subscribe(tuple -> {
+//                    var metrics = tuple.getT1();
+//                    var queueSize = tuple.getT2();
+//
+//                    log.debug(" Metrics - P95: {}ms, P99: {}ms, Pool: {}%, Queue: {}, Limit: {}",
+//                            metrics.getP95Latency() * 1000,
+//                            metrics.getP99Latency() * 1000,
+//                            metrics.getConnectionPoolUsage(),
+//                            queueSize,
+//                            rateLimiterService.getCurrentLimit());
+//
+//                    evaluateAndAdjust(metrics, queueSize);
+//                }, error -> {
+//                    log.error("Failed to collect metrics", error);
+//                });
+//    }
 
     private void evaluateAndAdjust(
             PrometheusMetricsCollector.MetricsSnapshot metrics,
