@@ -39,6 +39,11 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         String path = exchange.getRequest().getURI().getPath();
 
+        // /api/v1/orders/bf만 체크
+        if (!path.startsWith("/api/v1/orders")) {
+            return chain.filter(exchange);
+        }
+
         return rateLimiterService.tryConsume()
                 .flatMap(hasToken -> {
                     if (hasToken) {
