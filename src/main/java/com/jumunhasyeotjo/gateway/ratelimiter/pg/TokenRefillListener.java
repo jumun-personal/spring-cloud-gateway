@@ -25,7 +25,10 @@ public class TokenRefillListener {
 
     @Scheduled(fixedDelay = 100)
     public void processQueue() {
-        rateLimiterService.findAvailableProvider()
+        // 큐에 아이템 있을 때만 토큰 소비
+        queueService.getQueueSize()
+                .filter(size -> size > 0)
+                .flatMap(size -> rateLimiterService.findAvailableProvider())
                 .flatMap(provider -> queueService.poll(1)
                         .flatMap(items -> {
                             if (items.isEmpty()) {
