@@ -21,14 +21,14 @@ public class FeedbackLoopScheduler {
     private final GlobalQueueService queueService;
     private final FeedbackLoopProperties properties;
 
-    @Value("${prometheus.scrape-interval:15}")
+    @Value("${prometheus.scrape-interval:30}")
     private int scrapeInterval;
 
     private final AtomicInteger consecutiveOverloadCount = new AtomicInteger(0);
     private final AtomicInteger consecutiveHealthyCount = new AtomicInteger(0);
     private LocalDateTime lastAdjustmentTime = LocalDateTime.now();
 
-    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:15}000")
+    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:30}000")
     public void feedbackLoop() {
         metricsCollector.collectOrderServiceMetrics()
                 .zipWith(queueService.getTotalQueueSize())
@@ -170,7 +170,7 @@ public class FeedbackLoopScheduler {
                     if (hasRealDemand &&
                             healthyCount >= 2 &&
                             LocalDateTime.now().isAfter(
-                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 2))) {
+                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 2L))) {
 
                         int currentLimit = rateLimiterService.getCurrentLimit();
 
