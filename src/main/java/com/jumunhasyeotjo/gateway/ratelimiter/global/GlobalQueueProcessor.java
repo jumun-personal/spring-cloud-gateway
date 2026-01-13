@@ -66,8 +66,6 @@ public class GlobalQueueProcessor {
      * 가중치 기반 큐 처리 Lua Script
      */
     private static final String WEIGHTED_POLL_LUA = """
-        cjson.encode_empty_table_as_object(false)
-        
         local orderQueueKey = KEYS[1]
         local otherQueueKey = KEYS[2]
         local orderRetryKey = KEYS[3]
@@ -145,7 +143,21 @@ public class GlobalQueueProcessor {
             end
         end
         
-        return cjson.encode(result)
+        local function toArray(t)
+            local arr = {}
+            for i = 1, #t do
+                arr[i] = t[i]
+            end
+            return arr
+        end
+        
+        -- 반환 직전
+        return cjson.encode({
+            orderRetry  = toArray(result.orderRetry),
+            orderNormal = toArray(result.orderNormal),
+            otherRetry  = toArray(result.otherRetry),
+            otherNormal = toArray(result.otherNormal)
+        })
         """;
 
     private RedisScript<String> weightedPollScript;
@@ -213,13 +225,21 @@ public class GlobalQueueProcessor {
                 .next()
                 .flatMap(result -> {
                     try {
-                        Map<String, List<String>> parsed = objectMapper.readValue(
-                                result, new TypeReference<Map<String, List<String>>>() {});
+                        Map<String, Object> parsed =
+                                objectMapper.readValue(result, new TypeReference<Map<String, Object>>() {});
 
-                        List<String> orderRetry = parsed.getOrDefault("orderRetry", List.of());
-                        List<String> orderNormal = parsed.getOrDefault("orderNormal", List.of());
-                        List<String> otherRetry = parsed.getOrDefault("otherRetry", List.of());
-                        List<String> otherNormal = parsed.getOrDefault("otherNormal", List.of());
+                        List<String> orderRetry = parsed.containsKey("orderRetry")
+                                ? objectMapper.convertValue(parsed.get("orderRetry"), new TypeReference<List<String>>() {})
+                                : List.of();
+                        List<String> orderNormal = parsed.containsKey("orderNormal")
+                                ? objectMapper.convertValue(parsed.get("orderNormal"), new TypeReference<List<String>>() {})
+                                : List.of();
+                        List<String> otherRetry = parsed.containsKey("otherRetry")
+                                ? objectMapper.convertValue(parsed.get("otherRetry"), new TypeReference<List<String>>() {})
+                                : List.of();
+                        List<String> otherNormal = parsed.containsKey("otherNormal")
+                                ? objectMapper.convertValue(parsed.get("otherNormal"), new TypeReference<List<String>>() {})
+                                : List.of();
 
                         log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
                                 orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
