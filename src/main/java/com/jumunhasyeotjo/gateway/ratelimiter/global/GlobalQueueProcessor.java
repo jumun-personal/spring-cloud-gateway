@@ -143,20 +143,18 @@ public class GlobalQueueProcessor {
             end
         end
         
-        local function toArray(t)
-            local arr = {}
-            for i = 1, #t do
-                arr[i] = t[i]
+        local function emptyArrayIfNil(t)
+            if t == nil or #t == 0 then
+                return {}  -- 항상 numeric array
             end
-            return arr
+            return t
         end
         
-        -- 반환 직전
         return cjson.encode({
-            orderRetry  = toArray(result.orderRetry),
-            orderNormal = toArray(result.orderNormal),
-            otherRetry  = toArray(result.otherRetry),
-            otherNormal = toArray(result.otherNormal)
+            orderRetry  = emptyArrayIfNil(result.orderRetry),
+            orderNormal = emptyArrayIfNil(result.orderNormal),
+            otherRetry  = emptyArrayIfNil(result.otherRetry),
+            otherNormal = emptyArrayIfNil(result.otherNormal)
         })
         """;
 
