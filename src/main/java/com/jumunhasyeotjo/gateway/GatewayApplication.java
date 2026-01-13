@@ -1,7 +1,8 @@
 package com.jumunhasyeotjo.gateway;
 
 import com.jumunhasyeotjo.gateway.ratelimiter.global.FeedbackLoopProperties;
-import com.jumunhasyeotjo.gateway.ratelimiter.global.QueueWeightProperties;
+import com.jumunhasyeotjo.gateway.ratelimiter.global.LeakyBucketProperties;
+import com.jumunhasyeotjo.gateway.ratelimiter.global.QueueProperties;
 import jakarta.annotation.PostConstruct;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -12,15 +13,20 @@ import reactor.core.publisher.Hooks;
 
 @SpringBootApplication(exclude = { SecurityAutoConfiguration.class })
 @EnableScheduling
-@EnableConfigurationProperties({FeedbackLoopProperties.class, QueueWeightProperties.class})
+@EnableConfigurationProperties({
+        QueueProperties.class,
+        LeakyBucketProperties.class,
+        FeedbackLoopProperties.class
+
+})
 public class GatewayApplication {
 
-	public static void main(String[] args) {
-		SpringApplication.run(GatewayApplication.class, args);
-	}
+    public static void main(String[] args) {
+        SpringApplication.run(GatewayApplication.class, args);
+    }
 
-	@PostConstruct
-	public void init() {
-		Hooks.enableAutomaticContextPropagation();
-	}
+    @PostConstruct
+    public void init() {
+        Hooks.enableAutomaticContextPropagation();
+    }
 }

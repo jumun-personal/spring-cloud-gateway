@@ -1,27 +1,30 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
-import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
 import io.netty.channel.ConnectTimeoutException;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.ConnectException;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
 @Slf4j
@@ -32,129 +35,190 @@ public class GlobalQueueProcessor {
     private final GlobalQueueService globalQueueService;
     private final GlobalRateLimiterService globalRateLimiterService;
     private final ReactiveRateLimiterService pgRateLimiterService;
-    private final QueueWeightProperties weightProperties;
+    private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
+    private final QueueProperties queueProperties;
+    private final ObjectMapper objectMapper;
     private final WebClient webClient;
 
     private static final String DEFAULT_PROVIDER = "TOSS";
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(15);
 
-    @Scheduled(fixedDelay = 100)
+    private static final String ORDER_QUEUE_KEY = "queue:global:order";
+    private static final String OTHER_QUEUE_KEY = "queue:global:other";
+    private static final String ORDER_RETRY_KEY = "queue:global:order:retry";
+    private static final String OTHER_RETRY_KEY = "queue:global:other:retry";
+
+    /**
+     * 가중치 기반 큐 처리 Lua Script
+     *
+     * 처리 순서 (ORDER:OTHER = 7:3, retry:normal = 7:3 기준):
+     * 1. ORDER retry (총 슬롯의 7/10 중 7/10 = 49%)
+     * 2. ORDER normal (총 슬롯의 7/10 중 3/10 = 21%)
+     * 3. OTHER retry (총 슬롯의 3/10 중 7/10 = 21%)
+     * 4. OTHER normal (총 슬롯의 3/10 중 3/10 = 9%)
+     */
+    private static final String WEIGHTED_POLL_LUA = """
+        local orderQueueKey = KEYS[1]
+        local otherQueueKey = KEYS[2]
+        local orderRetryKey = KEYS[3]
+        local otherRetryKey = KEYS[4]
+        
+        local totalSlots = tonumber(ARGV[1])
+        local orderWeight = tonumber(ARGV[2])
+        local otherWeight = tonumber(ARGV[3])
+        local retryRatio = tonumber(ARGV[4])
+        local retryThreshold = tonumber(ARGV[5])
+        
+        local result = {
+            orderRetry = {},
+            orderNormal = {},
+            otherRetry = {},
+            otherNormal = {}
+        }
+        
+        -- 가중치 계산
+        local totalWeight = orderWeight + otherWeight
+        local orderSlots = math.ceil(totalSlots * orderWeight / totalWeight)
+        local otherSlots = totalSlots - orderSlots
+        
+        -- ORDER 슬롯 내 retry/normal 분배 (retry 우선, 7:3)
+        local orderRetrySlots = math.ceil(orderSlots * retryRatio)
+        local orderNormalSlots = orderSlots - orderRetrySlots
+        
+        -- OTHER 슬롯 내 retry/normal 분배
+        local otherRetrySlots = math.ceil(otherSlots * retryRatio)
+        local otherNormalSlots = otherSlots - otherRetrySlots
+        
+        -- 1. ORDER retry (eligible만)
+        if orderRetrySlots > 0 then
+            local items = redis.call('ZRANGEBYSCORE', orderRetryKey, 0, retryThreshold, 'LIMIT', 0, orderRetrySlots)
+            if #items > 0 then
+                for _, item in ipairs(items) do
+                    table.insert(result.orderRetry, item)
+                end
+                redis.call('ZREM', orderRetryKey, unpack(items))
+            end
+            -- 남은 슬롯을 normal로
+            orderNormalSlots = orderNormalSlots + (orderRetrySlots - #items)
+        end
+        
+        -- 2. ORDER normal
+        if orderNormalSlots > 0 then
+            local items = redis.call('ZRANGE', orderQueueKey, 0, orderNormalSlots - 1)
+            if #items > 0 then
+                for _, item in ipairs(items) do
+                    table.insert(result.orderNormal, item)
+                end
+                redis.call('ZREM', orderQueueKey, unpack(items))
+            end
+        end
+        
+        -- 3. OTHER retry (eligible만)
+        if otherRetrySlots > 0 then
+            local items = redis.call('ZRANGEBYSCORE', otherRetryKey, 0, retryThreshold, 'LIMIT', 0, otherRetrySlots)
+            if #items > 0 then
+                for _, item in ipairs(items) do
+                    table.insert(result.otherRetry, item)
+                end
+                redis.call('ZREM', otherRetryKey, unpack(items))
+            end
+            -- 남은 슬롯을 normal로
+            otherNormalSlots = otherNormalSlots + (otherRetrySlots - #items)
+        end
+        
+        -- 4. OTHER normal
+        if otherNormalSlots > 0 then
+            local items = redis.call('ZRANGE', otherQueueKey, 0, otherNormalSlots - 1)
+            if #items > 0 then
+                for _, item in ipairs(items) do
+                    table.insert(result.otherNormal, item)
+                end
+                redis.call('ZREM', otherQueueKey, unpack(items))
+            end
+        end
+        
+        return cjson.encode(result)
+        """;
+
+    private RedisScript<String> weightedPollScript;
+
+    @PostConstruct
+    public void init() {
+        weightedPollScript = RedisScript.of(WEIGHTED_POLL_LUA, String.class);
+    }
+
+    @Scheduled(fixedDelayString = "${queue.processor-interval-ms:100}")
     public void processQueue() {
-        pgRateLimiterService.getAvailableTokens(DEFAULT_PROVIDER)
-                .filter(pgTokens -> pgTokens > 0)
-                .flatMap(pgTokens -> globalRateLimiterService.getAvailableTokens()
-                        .map(globalTokens -> Math.min(pgTokens.intValue(), globalTokens.intValue())))
-                .filter(availableSlots -> availableSlots > 0)
-                .flatMap(this::processWithDynamicWeight)
+        // 큐가 비어있으면 즉시 리턴
+        globalQueueService.getTotalQueueSize()
+                .zipWith(globalQueueService.getTotalRetryQueueSize())
+                .filter(sizes -> sizes.getT1() > 0 || sizes.getT2() > 0)
+                .flatMap(sizes ->
+                        pgRateLimiterService.getAvailableTokens(DEFAULT_PROVIDER)
+                                .filter(pgTokens -> pgTokens > 0)
+                                .flatMap(pgTokens -> globalRateLimiterService.getAvailableTokens()
+                                        .map(globalTokens -> Math.min(pgTokens.intValue(), globalTokens.intValue())))
+                                .filter(availableSlots -> availableSlots > 0)
+                                .flatMap(this::processWithWeightedLua)
+                )
                 .subscribe(null, e -> log.error("Queue processing error", e));
     }
 
-    private Mono<Void> processWithDynamicWeight(int availableSlots) {
-        // 1. 모든 큐 사이즈 조회
-        return Mono.zip(
-                globalQueueService.getQueueSize(QueueType.ORDER),
-                globalQueueService.getQueueSize(QueueType.OTHER),
-                globalQueueService.getRetryEligibleCount(QueueType.ORDER),
-                globalQueueService.getRetryEligibleCount(QueueType.OTHER)
-        ).flatMap(tuple -> {
-            int orderQueueSize = tuple.getT1().intValue();
-            int otherQueueSize = tuple.getT2().intValue();
-            int orderRetrySize = tuple.getT3().intValue();
-            int otherRetrySize = tuple.getT4().intValue();
+    private Mono<Void> processWithWeightedLua(int availableSlots) {
+        QueueProperties.Weight weight = queueProperties.getWeight();
+        long retryThreshold = System.currentTimeMillis() - 
+                (queueProperties.getRetry().getEligibleAfterSeconds() * 1000L);
 
-            // 2. 가중치로 ORDER/OTHER 슬롯 분배
-            int[] slots = calculateSlots(availableSlots, 
-                    orderQueueSize + orderRetrySize, 
-                    otherQueueSize + otherRetrySize);
-            int orderSlots = slots[0];
-            int otherSlots = slots[1];
+        return reactiveRedisTemplate.execute(
+                weightedPollScript,
+                Arrays.asList(ORDER_QUEUE_KEY, OTHER_QUEUE_KEY, ORDER_RETRY_KEY, OTHER_RETRY_KEY),
+                String.valueOf(availableSlots),
+                String.valueOf(weight.getOrder()),
+                String.valueOf(weight.getOther()),
+                String.valueOf(weight.getRetryRatio()),
+                String.valueOf(retryThreshold)
+        )
+        .next()
+        .flatMap(result -> {
+            try {
+                Map<String, List<String>> parsed = objectMapper.readValue(
+                        result, new TypeReference<Map<String, List<String>>>() {});
 
-            // 3. 각 타입 내에서 retry 우선 처리
-            int orderRetrySlots = Math.min(orderSlots, orderRetrySize);
-            int orderNormalSlots = orderSlots - orderRetrySlots;
+                List<String> orderRetry = parsed.get("orderRetry");
+                List<String> orderNormal = parsed.get("orderNormal");
+                List<String> otherRetry = parsed.get("otherRetry");
+                List<String> otherNormal = parsed.get("otherNormal");
 
-            int otherRetrySlots = Math.min(otherSlots, otherRetrySize);
-            int otherNormalSlots = otherSlots - otherRetrySlots;
+                log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
+                        orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
 
-            log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
-                    orderRetrySlots, orderNormalSlots, otherRetrySlots, otherNormalSlots);
+                // 순서대로 처리
+                return processItems(orderRetry, QueueType.ORDER, true)
+                        .then(processItems(orderNormal, QueueType.ORDER, false))
+                        .then(processItems(otherRetry, QueueType.OTHER, true))
+                        .then(processItems(otherNormal, QueueType.OTHER, false));
 
-            // 4. 처리 실행
-            return processQueueType(QueueType.ORDER, orderRetrySlots, orderNormalSlots)
-                    .then(processQueueType(QueueType.OTHER, otherRetrySlots, otherNormalSlots));
+            } catch (Exception e) {
+                log.error("Failed to parse weighted poll result", e);
+                return Mono.empty();
+            }
         });
     }
 
-    private Mono<Void> processQueueType(QueueType queueType, int retrySlots, int normalSlots) {
-        return processRetryQueue(queueType, retrySlots)
-                .then(processNormalQueue(queueType, normalSlots));
-    }
-
-    private Mono<Void> processRetryQueue(QueueType queueType, int count) {
-        if (count <= 0) {
+    private Mono<Void> processItems(List<String> items, QueueType queueType, boolean isRetry) {
+        if (items == null || items.isEmpty()) {
             return Mono.empty();
         }
 
-        return globalQueueService.pollRetryEligible(queueType, count)
-                .flatMapMany(Flux::fromIterable)
-                .flatMap(item -> processItem(item, queueType, true), 1)
+        return Flux.fromIterable(items)
+                .map(this::deserialize)
+                .flatMap(item -> processItem(item, queueType, isRetry), 1)
                 .then();
-    }
-
-    private Mono<Void> processNormalQueue(QueueType queueType, int count) {
-        if (count <= 0) {
-            return Mono.empty();
-        }
-
-        return globalQueueService.poll(queueType, count)
-                .flatMapMany(Flux::fromIterable)
-                .flatMap(item -> processItem(item, queueType, false), 1)
-                .then();
-    }
-
-    private int[] calculateSlots(int availableSlots, int orderTotal, int otherTotal) {
-        if (orderTotal == 0 && otherTotal == 0) {
-            return new int[]{0, 0};
-        }
-        if (orderTotal == 0) {
-            return new int[]{0, Math.min(availableSlots, otherTotal)};
-        }
-        if (otherTotal == 0) {
-            return new int[]{Math.min(availableSlots, orderTotal), 0};
-        }
-
-        int orderWeight = weightProperties.getOrder();
-        int otherWeight = weightProperties.getOther();
-        int totalWeight = orderWeight + otherWeight;
-
-        int baseOrderSlots = (int) Math.ceil(availableSlots * (double) orderWeight / totalWeight);
-        int baseOtherSlots = availableSlots - baseOrderSlots;
-
-        int actualOrderSlots = Math.min(baseOrderSlots, orderTotal);
-        int actualOtherSlots = Math.min(baseOtherSlots, otherTotal);
-
-        int remainingSlots = availableSlots - actualOrderSlots - actualOtherSlots;
-
-        if (remainingSlots > 0) {
-            int orderCanTakeMore = orderTotal - actualOrderSlots;
-            int otherCanTakeMore = otherTotal - actualOtherSlots;
-
-            if (orderCanTakeMore > 0) {
-                int extra = Math.min(remainingSlots, orderCanTakeMore);
-                actualOrderSlots += extra;
-                remainingSlots -= extra;
-            }
-            if (remainingSlots > 0 && otherCanTakeMore > 0) {
-                int extra = Math.min(remainingSlots, otherCanTakeMore);
-                actualOtherSlots += extra;
-            }
-        }
-
-        return new int[]{actualOrderSlots, actualOtherSlots};
     }
 
     private Mono<Void> processItem(QueueItem item, QueueType queueType, boolean isRetry) {
-        return globalRateLimiterService.tryConsume()
+        // 대기열 요청용 토큰 획득
+        return globalRateLimiterService.tryConsumeForQueueRequest()
                 .flatMap(globalOk -> {
                     if (!globalOk) {
                         log.debug("Global token exhausted, re-queuing userId={}", item.getUserId());
@@ -175,45 +239,46 @@ public class GlobalQueueProcessor {
         if (wasRetry) {
             return globalQueueService.offerToRetry(item, queueType).then();
         }
-        return globalQueueService.offer(item, queueType).then();
+        return globalQueueService.offer(item, queueType)
+                .onErrorResume(e -> {
+                    log.error("Queue full, moving to DLQ userId={}", item.getUserId());
+                    return globalQueueService.offerToDlq(item, "QUEUE_FULL");
+                })
+                .then();
     }
 
     private Mono<Void> executeRequest(QueueItem item, QueueType queueType, boolean isRetry) {
-        HttpRequestData request = item.getHttpRequest();
-        if (request == null) {
-            log.warn("Invalid request data for userId={}", item.getUserId());
-            return Mono.empty();
+        String command = item.getCommand();
+
+        if ("CREATE_ORDER".equals(command)) {
+            return executeOrderRequest(item, queueType, isRetry);
         }
 
-        String path = extractPath(request.getUri());
-        URI original = URI.create(request.getUri());
+        log.warn("Unknown command: {}, userId={}", command, item.getUserId());
+        return Mono.empty();
+    }
 
+    private Mono<Void> executeOrderRequest(QueueItem item, QueueType queueType, boolean isRetry) {
         return webClient
-                .method(HttpMethod.valueOf(request.getMethod()))
+                .method(HttpMethod.POST)
                 .uri(uriBuilder -> uriBuilder
                         .scheme("lb")
                         .host("order-to-shipping-service")
-                        .path(original.getPath())
-                        .query(original.getQuery())
+                        .path("/api/v1/orders/bf/queue")
                         .queryParam("provider", DEFAULT_PROVIDER)
-                        .build(true))
-                .headers(headers -> {
-                    headers.setContentType(MediaType.APPLICATION_JSON);
-                    if (request.getHeaders() != null) {
-                        request.getHeaders().forEach(headers::add);
-                    }
-                    if (item.getAccessToken() != null) {
-                        headers.set("Authorization", "Bearer " + item.getAccessToken());
-                    }
-                })
-                .body(request.getBody() != null ? BodyInserters.fromValue(request.getBody()) : BodyInserters.empty())
+                        .build())
+                .headers(headers -> headers.setContentType(MediaType.APPLICATION_JSON))
+                .bodyValue(new QueueOrderRequest(
+                        item.getUserId(),
+                        item.getResourceId(),
+                        item.getIdempotencyKey()
+                ))
                 .retrieve()
                 .onStatus(status -> status.is5xxServerError(),
                         response -> Mono.error(new RuntimeException("Server error: " + response.statusCode())))
                 .bodyToMono(String.class)
                 .timeout(REQUEST_TIMEOUT)
-                .doOnSuccess(r -> log.info("Processed {} request for userId={}, isRetry={}",
-                        DEFAULT_PROVIDER, item.getUserId(), isRetry))
+                .doOnSuccess(r -> log.info("Processed order for userId={}, isRetry={}", item.getUserId(), isRetry))
                 .then()
                 .onErrorResume(e -> handleRequestError(e, item, queueType, isRetry));
     }
@@ -222,10 +287,10 @@ public class GlobalQueueProcessor {
         log.error("Request failed for userId={}, isRetry={}, error={}",
                 item.getUserId(), isRetry, e.getMessage());
 
-        // 이미 재시도한 건 폐기
+        // 이미 재시도한 건 DLQ로
         if (isRetry) {
-            log.error("Retry failed, dropping request for userId={}", item.getUserId());
-            return Mono.empty();
+            log.error("Retry failed, moving to DLQ userId={}", item.getUserId());
+            return globalQueueService.offerToDlq(item, e.getMessage()).then();
         }
 
         // 재시도 가능한 에러인지 확인
@@ -235,8 +300,9 @@ public class GlobalQueueProcessor {
             return globalQueueService.offerToRetry(item, queueType).then();
         }
 
-        log.error("Non-retryable error, dropping userId={}", item.getUserId());
-        return Mono.empty();
+        // 재시도 불가능한 에러는 DLQ로
+        log.error("Non-retryable error, moving to DLQ userId={}", item.getUserId());
+        return globalQueueService.offerToDlq(item, e.getMessage()).then();
     }
 
     private boolean isRetryable(Throwable e) {
@@ -253,14 +319,14 @@ public class GlobalQueueProcessor {
         return false;
     }
 
-    private String extractPath(String uri) {
+    private QueueItem deserialize(String json) {
         try {
-            URI parsed = new URI(uri);
-            String path = parsed.getPath();
-            String query = parsed.getQuery();
-            return query != null ? path + "?" + query : path;
+            return objectMapper.readValue(json, QueueItem.class);
         } catch (Exception e) {
-            return uri;
+            log.error("Failed to deserialize QueueItem: {}", json, e);
+            throw new RuntimeException(e);
         }
     }
+
+    private record QueueOrderRequest(Long userId, java.util.UUID resourceId, String idempotencyKey) {}
 }

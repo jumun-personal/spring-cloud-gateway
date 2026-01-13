@@ -7,31 +7,32 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @Data
 public class FeedbackLoopProperties {
 
-    private LatencyThresholds latency = new LatencyThresholds();
-    private PoolThresholds pool = new PoolThresholds();
-    private AdjustmentParams adjustment = new AdjustmentParams();
+    private int intervalMs = 2000;
+    private Latency latency = new Latency();
+    private Pool pool = new Pool();
+    private Adjustment adjustment = new Adjustment();
 
     @Data
-    public static class LatencyThresholds {
-        private int p95Good = 500;
-        private int p95Bad = 1000;
-        private int p99Good = 1000;
-        private int p99Bad = 2000;
+    public static class Latency {
+        private double p95Good = 200;   // ms
+        private double p95Bad = 1000;   // ms
+        private double p99Good = 500;   // ms
+        private double p99Bad = 2000;   // ms
     }
 
     @Data
-    public static class PoolThresholds {
-        private int good = 80;
-        private int bad = 95;
+    public static class Pool {
+        private double good = 50;   // %
+        private double bad = 90;    // %
     }
 
     @Data
-    public static class AdjustmentParams {
-        private double increaseFactor = 0.05;    // 5%
-        private double decreaseFactor = 0.25;    // 25%
-        private int minLimit = 10;               // 최소 제한
-        private int maxLimit = 1000;             // 최대 제한
-        private int maxDecrease = 15;            // 감소 최대값
-        private int minIncrease = 2;             // 최소 증가량
+    public static class Adjustment {
+        private int minLimit = 10;
+        private int maxLimit = 100;
+        private double increaseFactor = 0.05;
+        private double decreaseFactor = 0.15;
+        private int minIncrease = 1;
+        private int maxDecrease = 20;
     }
 }

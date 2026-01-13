@@ -1,309 +1,210 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
-import lombok.AllArgsConstructor;
-import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * Feedback Loop - Scale Out 이벤트 기반
+ *
+ * 트리거: Scale Out API 호출 시 활성화
+ * 증가: 현재 → 목표 (현재 + 15) 천천히
+ * 감소: 현재 → 이전 limit (최소값) 빠르게
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class FeedbackLoopScheduler {
 
-    private final PrometheusMetricsCollector metricsCollector;
+    private final LatencyHistogramService latencyHistogramService;
     private final GlobalRateLimiterService rateLimiterService;
     private final GlobalQueueService queueService;
+    private final LeakyBucketProperties leakyBucketProperties;
     private final FeedbackLoopProperties properties;
 
-    @Value("${prometheus.scrape-interval:1}")
-    private int scrapeInterval;
-
-    private final AtomicInteger consecutiveOverloadCount = new AtomicInteger(0);
+    private final AtomicBoolean isActive = new AtomicBoolean(false);
+    private final AtomicInteger previousLimit = new AtomicInteger(30);
+    private final AtomicInteger targetLimit = new AtomicInteger(45);
     private final AtomicInteger consecutiveHealthyCount = new AtomicInteger(0);
+    private final AtomicInteger consecutiveUnhealthyCount = new AtomicInteger(0);
     private LocalDateTime lastAdjustmentTime = LocalDateTime.now();
 
-//    @Scheduled(fixedDelayString = "${prometheus.scrape-interval:2}00")
-//    public void feedbackLoop() {
-//        metricsCollector.collectOrderServiceMetrics()
-//                .zipWith(queueService.getTotalQueueSize())
-//                .subscribe(tuple -> {
-//                    var metrics = tuple.getT1();
-//                    var queueSize = tuple.getT2();
-//
-//                    log.debug(" Metrics - P95: {}ms, P99: {}ms, Pool: {}%, Queue: {}, Limit: {}",
-//                            metrics.getP95Latency() * 1000,
-//                            metrics.getP99Latency() * 1000,
-//                            metrics.getConnectionPoolUsage(),
-//                            queueSize,
-//                            rateLimiterService.getCurrentLimit());
-//
-//                    evaluateAndAdjust(metrics, queueSize);
-//                }, error -> {
-//                    log.error("Failed to collect metrics", error);
-//                });
-//    }
-
-    private void evaluateAndAdjust(
-            PrometheusMetricsCollector.MetricsSnapshot metrics,
-            Long queueSize) {
-
-        double p95Ms = metrics.getP95Latency() * 1000;
-        double p99Ms = metrics.getP99Latency() * 1000;
-        double connPool = metrics.getConnectionPoolUsage();
-
-        SystemHealthScore healthScore = calculateHealthScore(p95Ms, p99Ms, connPool);
-
-        log.debug(" Health Score: {}/100 ({})",
-                String.format("%.1f", healthScore.getScore()),
-                healthScore.getLevel());
-
-        // UNKNOWN 연결 오류
-        if(healthScore.getScore() == -1 ){
-            handleUnknown();
-        }
-        //  심각한 과부하 (Score < 30)
-        else if (healthScore.getScore() < 30) {
-            handleCriticalOverload(healthScore);
-        }
-        //  경미한 과부하 (Score < 80)
-        else if (healthScore.getScore() < 80) {
-            handleModerateOverload(healthScore);
-        }
-        //  건강 상태 (Score >= 80) + 수요 있음
-        else if (healthScore.getScore() >= 80 && queueSize > 0) {
-            handleHealthyWithDemand(queueSize);
-        }
-        //   건강 상태 + 수요 없음
-        else {
-            handleHealthyNoDemand();
-        }
-    }
+    private static final int TARGET_OFFSET = 15;
+    private static final double INCREASE_RATE = 0.05;  // 5% 증가
+    private static final double DECREASE_RATE = 0.15;  // 15% 감소
 
     /**
-     * 심각한 과부하 처리 (Score < 30)
+     * Scale Out 이벤트로 Feedback Loop 시작
      */
-    private void handleCriticalOverload(SystemHealthScore score) {
-        log.error(" CRITICAL OVERLOAD - Score: {}/100",
-                String.format("%.1f", score.getScore()));
-
-        int overloadCount = consecutiveOverloadCount.incrementAndGet();
+    public void startFeedbackLoop() {
+        int currentLimit = leakyBucketProperties.getGlobal().getCapacity();
+        
+        previousLimit.set(currentLimit);
+        targetLimit.set(currentLimit + TARGET_OFFSET);
+        isActive.set(true);
+        
         consecutiveHealthyCount.set(0);
-
-        if (overloadCount >= 5) {
-            int currentLimit = rateLimiterService.getCurrentLimit();
-
-            //  감소량 계산
-            int decrease = (int) (currentLimit * properties.getAdjustment().getDecreaseFactor());
-            decrease = Math.min(decrease, properties.getAdjustment().getMaxDecrease());  // 최대 30
-            decrease = Math.max(decrease, 10);  // 최소 5
-
-            // 최소 제한 확인
-            int newLimit = Math.max(
-                    currentLimit - decrease,
-                    properties.getAdjustment().getMinLimit()
-            );
-            int actualDecrease = currentLimit - newLimit;
-
-            rateLimiterService.decreaseLimit(actualDecrease);
-            lastAdjustmentTime = LocalDateTime.now();
-            consecutiveOverloadCount.set(0);
-
-            log.warn("⬇ CRITICAL: {} → {} (-{})",
-                    currentLimit, newLimit, actualDecrease);
-        }
+        consecutiveUnhealthyCount.set(0);
+        lastAdjustmentTime = LocalDateTime.now();
+        
+        // Histogram 초기화
+        latencyHistogramService.reset().subscribe();
+        
+        log.info("Feedback Loop started - previous: {}, target: {}", 
+                previousLimit.get(), targetLimit.get());
     }
 
     /**
-     * 경미한 과부하 처리 (Score < 80)
+     * Feedback Loop 중지
      */
-    private void handleModerateOverload(SystemHealthScore score) {
-        log.warn(" MODERATE OVERLOAD - Score: {}/100",
-                String.format("%.1f", score.getScore()));
-
-        int overloadCount = consecutiveOverloadCount.incrementAndGet();
-        consecutiveHealthyCount.set(0);
-
-        if (overloadCount >= 5 &&
-                LocalDateTime.now().isAfter(lastAdjustmentTime.plusSeconds(scrapeInterval))) {
-
-            int currentLimit = rateLimiterService.getCurrentLimit();
-
-            //  감소량 계산 (10% 또는 최대 30)
-            int decrease = (int) (currentLimit * 0.10);
-            decrease = Math.min(decrease, properties.getAdjustment().getMaxDecrease());
-            decrease = Math.max(decrease, 3);  // 최소 3
-
-            int newLimit = Math.max(
-                    currentLimit - decrease,
-                    properties.getAdjustment().getMinLimit()
-            );
-            int actualDecrease = currentLimit - newLimit;
-
-            rateLimiterService.decreaseLimit(actualDecrease);
-            lastAdjustmentTime = LocalDateTime.now();
-            consecutiveOverloadCount.set(0);
-
-            log.warn("⬇ MODERATE: {} → {} (-{})",
-                    currentLimit, newLimit, actualDecrease);
-        }
+    public void stopFeedbackLoop() {
+        isActive.set(false);
+        log.info("Feedback Loop stopped - current limit: {}", 
+                leakyBucketProperties.getGlobal().getCapacity());
     }
 
     /**
-     * 건강 + 수요 있음 → 증가
+     * 주기적 실행 (활성화 상태일 때만)
      */
-    private void handleHealthyWithDemand(Long queueSize) {
-        log.debug(" HEALTHY with demand - Queue: {}", queueSize);
-
-        int healthyCount = consecutiveHealthyCount.incrementAndGet();
-        consecutiveOverloadCount.set(0);
-
-        rateLimiterService.isTokenSaturated()
-                .subscribe(saturated -> {
-                    boolean hasRealDemand = saturated || queueSize > 5;
-
-                    if (hasRealDemand &&
-                            healthyCount >= 29*5 &&
-                            LocalDateTime.now().isAfter(
-                                    lastAdjustmentTime.plusSeconds(scrapeInterval * 29L))) {
-
-                        int currentLimit = rateLimiterService.getCurrentLimit();
-
-                        //  증가량 계산 (5% 이상)
-                        int increase = (int) (currentLimit * properties.getAdjustment().getIncreaseFactor());
-                        increase = Math.max(increase, properties.getAdjustment().getMinIncrease());  // 최소 1
-
-                        // 최대 제한 확인
-                        int newLimit = Math.min(
-                                currentLimit + increase,
-                                properties.getAdjustment().getMaxLimit()
-                        );
-                        int actualIncrease = newLimit - currentLimit;
-
-                        if (actualIncrease > 0) {
-                            rateLimiterService.increaseLimit(actualIncrease);
-                            lastAdjustmentTime = LocalDateTime.now();
-                            consecutiveHealthyCount.set(0);
-
-                            log.debug("️ HEALTHY: {} → {} (+{})",
-                                    currentLimit, newLimit, actualIncrease);
-                        }
-                    }
-                }, error -> {
-                    log.error("Failed to check token saturation", error);
-                });
-    }
-
-    /**
-     * UNKNOWN → 유지
-     */
-    private void handleUnknown() {
-        log.debug(" UNKNOWN - maintaining limit: {}",
-                rateLimiterService.getCurrentLimit());
-        consecutiveOverloadCount.set(0);
-        consecutiveHealthyCount.set(0);
-    }
-
-    /**
-     * 건강 + 수요 없음 → 기본값까지 점진 감소
-     */
-    private void handleHealthyNoDemand() {
-        int currentLimit = rateLimiterService.getCurrentLimit();
-        int baseLimit = properties.getAdjustment().getMinLimit(); // 또는 minLimit
-
-        consecutiveOverloadCount.set(0);
-        consecutiveHealthyCount.set(0);
-
-        // 이미 기본값이면 유지
-        if (currentLimit <= baseLimit) {
-            log.debug(" HEALTHY - No demand, already at base limit: {}", currentLimit);
+    //@Scheduled(fixedDelayString = "${feedback-loop.interval-ms:2000}")
+    public void feedbackLoop() {
+        if (!isActive.get()) {
             return;
         }
 
-        // 20% 감소
-        int decrease = (int) (currentLimit * 0.20);
-        decrease = Math.max(decrease, 5); // 최소 5 보장
+        latencyHistogramService.getPercentiles()
+                .zipWith(queueService.getTotalQueueSize())
+                .subscribe(tuple -> {
+                    var percentiles = tuple.getT1();
+                    var queueSize = tuple.getT2();
 
-        int newLimit = Math.max(currentLimit - decrease, baseLimit);
-        int actualDecrease = currentLimit - newLimit;
+                    log.debug("Feedback Loop - P95: {}ms, P99: {}ms, Queue: {}, Limit: {}",
+                            percentiles.getP95(),
+                            percentiles.getP99(),
+                            queueSize,
+                            leakyBucketProperties.getGlobal().getCapacity());
 
-        if (actualDecrease > 0) {
-            rateLimiterService.decreaseLimit(actualDecrease);
-            lastAdjustmentTime = LocalDateTime.now();
+                    evaluateAndAdjust(percentiles.getP95(), percentiles.getP99(), queueSize);
+                }, error -> {
+                    log.error("Feedback Loop error", error);
+                });
+    }
 
-            log.debug("⬇ IDLE SCALE-IN: {} → {} (-{})",
-                    currentLimit, newLimit, actualDecrease);
+    private void evaluateAndAdjust(double p95Ms, double p99Ms, Long queueSize) {
+        var latency = properties.getLatency();
+        int currentLimit = leakyBucketProperties.getGlobal().getCapacity();
+        int prevLimit = previousLimit.get();
+        int target = targetLimit.get();
+
+        // 건강 상태 판단
+        boolean isHealthy = p95Ms <= latency.getP95Good() && p99Ms <= latency.getP99Good();
+        boolean isCritical = p95Ms >= latency.getP95Bad() || p99Ms >= latency.getP99Bad();
+
+        if (isCritical) {
+            handleCritical(currentLimit, prevLimit, p95Ms, p99Ms);
+        } else if (!isHealthy) {
+            handleModerate(currentLimit, prevLimit, p95Ms, p99Ms);
+        } else if (queueSize > 0 && currentLimit < target) {
+            handleHealthyWithDemand(currentLimit, target);
+        } else {
+            handleHealthyNoDemand(currentLimit);
         }
     }
 
     /**
-     * 시스템 건강 점수 계산 (0~100)
+     * Critical 상태 - 빠른 감소
      */
-    private SystemHealthScore calculateHealthScore(
-            double p95Ms, double p99Ms, double connPool) {
+    private void handleCritical(int currentLimit, int minLimit, double p95, double p99) {
+        consecutiveHealthyCount.set(0);
+        int unhealthyCount = consecutiveUnhealthyCount.incrementAndGet();
 
-        var latency = properties.getLatency();
-        var pool = properties.getPool();
+        log.warn("CRITICAL - P95: {}ms, P99: {}ms, count: {}", p95, p99, unhealthyCount);
 
-        double p95Score = calculateLatencyScore(
-                p95Ms, latency.getP95Good(), latency.getP95Bad()
-        );
-        double p99Score = calculateLatencyScore(
-                p99Ms, latency.getP99Good(), latency.getP99Bad()
-        );
-        double poolScore = calculatePoolScore(
-                connPool, pool.getGood(), pool.getBad()
-        );
+        if (unhealthyCount >= 2) {
+            // 15% 감소, 최소값은 이전 limit
+            int decrease = (int) Math.max(currentLimit * DECREASE_RATE, 3);
+            int newLimit = Math.max(currentLimit - decrease, minLimit);
 
-        // 가중 평균
-        double totalScore = (p95Score * 0.3) + (p99Score * 0.4) + (poolScore * 0.3);
-
-        if(p95Ms == 0.0 && p99Ms == 0.0 && connPool == 0.0){
-            return new SystemHealthScore(-1, p95Score, p99Score, poolScore);
-        }
-
-        return new SystemHealthScore(totalScore, p95Score, p99Score, poolScore);
-    }
-
-    private double calculateLatencyScore(double actual, double good, double bad) {
-        if (actual <= good) {
-            return 100.0;
-        } else if (actual >= bad) {
-            return 0.0;
-        } else {
-            return 100.0 * (1 - (actual - good) / (bad - good));
+            if (newLimit < currentLimit) {
+                updateLimit(newLimit);
+                log.warn("⬇ CRITICAL: {} → {} (min: {})", currentLimit, newLimit, minLimit);
+                consecutiveUnhealthyCount.set(0);
+            }
         }
     }
 
-    private double calculatePoolScore(double usage, double good, double bad) {
-        if (usage <= good) {
-            return 100.0;
-        } else if (usage >= bad) {
-            return 0.0;
-        } else {
-            return 100.0 * (1 - (usage - good) / (bad - good));
+    /**
+     * Moderate 상태 - 적당한 감소
+     */
+    private void handleModerate(int currentLimit, int minLimit, double p95, double p99) {
+        consecutiveHealthyCount.set(0);
+        int unhealthyCount = consecutiveUnhealthyCount.incrementAndGet();
+
+        log.debug("MODERATE - P95: {}ms, P99: {}ms, count: {}", p95, p99, unhealthyCount);
+
+        if (unhealthyCount >= 3) {
+            // 10% 감소, 최소값은 이전 limit
+            int decrease = (int) Math.max(currentLimit * 0.10, 2);
+            int newLimit = Math.max(currentLimit - decrease, minLimit);
+
+            if (newLimit < currentLimit) {
+                updateLimit(newLimit);
+                log.warn("⬇ MODERATE: {} → {} (min: {})", currentLimit, newLimit, minLimit);
+                consecutiveUnhealthyCount.set(0);
+            }
         }
     }
 
-    @Data
-    @AllArgsConstructor
-    private static class SystemHealthScore {
-        private double score;
-        private double p95Score;
-        private double p99Score;
-        private double poolScore;
+    /**
+     * Healthy + 대기열 있음 - 느린 증가
+     */
+    private void handleHealthyWithDemand(int currentLimit, int maxLimit) {
+        consecutiveUnhealthyCount.set(0);
+        int healthyCount = consecutiveHealthyCount.incrementAndGet();
 
-        public String getLevel() {
-            if (score >= 80) return "EXCELLENT";
-            if (score >= 60) return "GOOD";
-            if (score >= 30) return "DEGRADED";
-            if (score == -1) return "UNKNOWN";
-            return "CRITICAL";
+        if (healthyCount >= 5 && currentLimit < maxLimit) {
+            // 5% 증가, 최대값은 target limit
+            int increase = (int) Math.max(currentLimit * INCREASE_RATE, 1);
+            int newLimit = Math.min(currentLimit + increase, maxLimit);
+
+            if (newLimit > currentLimit) {
+                updateLimit(newLimit);
+                log.info("⬆ HEALTHY: {} → {} (max: {})", currentLimit, newLimit, maxLimit);
+                consecutiveHealthyCount.set(0);
+            }
         }
+    }
+
+    /**
+     * Healthy + 대기열 없음 - 유지
+     */
+    private void handleHealthyNoDemand(int currentLimit) {
+        consecutiveUnhealthyCount.set(0);
+        consecutiveHealthyCount.set(0);
+        log.debug("HEALTHY - No demand, maintaining limit: {}", currentLimit);
+    }
+
+    private void updateLimit(int newLimit) {
+        // LeakyBucketProperties의 capacity와 rate 동시 업데이트
+        leakyBucketProperties.getGlobal().setCapacity(newLimit);
+        leakyBucketProperties.getGlobal().setRate(newLimit);
+        lastAdjustmentTime = LocalDateTime.now();
+    }
+
+    // Getters for monitoring
+    public boolean isActive() {
+        return isActive.get();
+    }
+
+    public int getPreviousLimit() {
+        return previousLimit.get();
+    }
+
+    public int getTargetLimit() {
+        return targetLimit.get();
     }
 }

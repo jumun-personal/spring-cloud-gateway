@@ -9,7 +9,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 
 import java.util.Collections;
@@ -23,11 +25,13 @@ public class GlobalQueueService {
 
     private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
     private final ObjectMapper objectMapper;
+    private final QueueProperties queueProperties;
 
     private static final String ORDER_QUEUE_KEY = "queue:global:order";
     private static final String OTHER_QUEUE_KEY = "queue:global:other";
     private static final String ORDER_RETRY_QUEUE_KEY = "queue:global:order:retry";
     private static final String OTHER_RETRY_QUEUE_KEY = "queue:global:other:retry";
+    private static final String DLQ_KEY = "queue:global:dlq";
 
     @Getter
     public enum QueueType {
@@ -50,38 +54,72 @@ public class GlobalQueueService {
         return QueueType.OTHER;
     }
 
-    public Mono<Boolean> offer(QueueItem item, QueueType queueType) {
-        return Mono.fromCallable(() -> objectMapper.writeValueAsString(item))
-                .flatMap(value -> {
-                    double score = item.getOriginalTimestamp();
-                    return reactiveRedisTemplate.opsForZSet().add(queueType.getKey(), value, score);
-                })
-                .doOnNext(added -> log.debug("Queue offer [{}]: {}", queueType, added));
+    public QueueType resolveQueueType(String command) {
+        if ("CREATE_ORDER".equals(command)) {
+            return QueueType.ORDER;
+        }
+        return QueueType.OTHER;
     }
 
+    /**
+     * 대기열에 추가 (크기 제한 체크)
+     */
+    public Mono<Boolean> offer(QueueItem item, QueueType queueType) {
+        return getTotalQueueSize()
+                .flatMap(currentSize -> {
+                    if (currentSize >= queueProperties.getMaxSize()) {
+                        log.warn("Queue full, rejecting request. current={}, max={}", 
+                                currentSize, queueProperties.getMaxSize());
+                        return Mono.error(new ResponseStatusException(
+                                HttpStatus.SERVICE_UNAVAILABLE, 
+                                "대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요."));
+                    }
+                    return doOffer(item, queueType.getKey());
+                });
+    }
+
+    /**
+     * 재시도 큐에 추가
+     */
     public Mono<Boolean> offerToRetry(QueueItem item, QueueType queueType) {
+        return doOffer(item, queueType.getRetryKey())
+                .doOnNext(added -> log.debug("Retry queue offer [{}]: {}", queueType, added));
+    }
+
+    /**
+     * DLQ에 추가 (재시도 실패 시)
+     */
+    public Mono<Boolean> offerToDlq(QueueItem item, String failReason) {
+        return Mono.fromCallable(() -> {
+                    item.setCommand(item.getCommand() + ":FAILED:" + failReason);
+                    return objectMapper.writeValueAsString(item);
+                })
+                .flatMap(value -> {
+                    double score = System.currentTimeMillis();
+                    return reactiveRedisTemplate.opsForZSet().add(DLQ_KEY, value, score);
+                })
+                .doOnNext(added -> log.error("DLQ offer: userId={}, reason={}", item.getUserId(), failReason));
+    }
+
+    private Mono<Boolean> doOffer(QueueItem item, String key) {
         return Mono.fromCallable(() -> objectMapper.writeValueAsString(item))
                 .flatMap(value -> {
                     double score = item.getOriginalTimestamp();
-                    return reactiveRedisTemplate.opsForZSet().add(queueType.getRetryKey(), value, score);
-                })
-                .doOnNext(added -> log.debug("Retry queue offer [{}]: {}", queueType, added));
+                    return reactiveRedisTemplate.opsForZSet().add(key, value, score);
+                });
     }
 
     public Mono<List<QueueItem>> poll(QueueType queueType, int size) {
         return pollFromKey(queueType.getKey(), size);
     }
 
-    public Mono<List<QueueItem>> pollFromRetry(QueueType queueType, int size) {
-        return pollFromKey(queueType.getRetryKey(), size);
-    }
-
     /**
-     * 재시도 큐에서 4초 이상 경과한 아이템만 조회
+     * 재시도 큐에서 eligible 아이템만 조회 (설정된 시간 경과한 것)
      */
     public Mono<List<QueueItem>> pollRetryEligible(QueueType queueType, int size) {
-        long threshold = System.currentTimeMillis() - 4000; // 4초 전
-        
+        long thresholdMs = queueProperties.getRetry().getEligibleAfterSeconds() * 1000L;
+        long threshold = System.currentTimeMillis() - thresholdMs;
+
         return reactiveRedisTemplate.opsForZSet()
                 .rangeByScore(queueType.getRetryKey(), Range.closed(0.0, (double) threshold))
                 .take(size)
@@ -154,10 +192,11 @@ public class GlobalQueueService {
     }
 
     /**
-     * 4초 이상 경과한 재시도 대기 아이템 수
+     * eligible 재시도 아이템 수 (설정된 시간 경과한 것)
      */
     public Mono<Long> getRetryEligibleCount(QueueType queueType) {
-        long threshold = System.currentTimeMillis() - 4000;
+        long thresholdMs = queueProperties.getRetry().getEligibleAfterSeconds() * 1000L;
+        long threshold = System.currentTimeMillis() - thresholdMs;
         return reactiveRedisTemplate.opsForZSet()
                 .count(queueType.getRetryKey(), Range.closed(0.0, (double) threshold))
                 .defaultIfEmpty(0L);
@@ -173,6 +212,12 @@ public class GlobalQueueService {
         return getRetryQueueSize(QueueType.ORDER)
                 .zipWith(getRetryQueueSize(QueueType.OTHER))
                 .map(tuple -> tuple.getT1() + tuple.getT2());
+    }
+
+    public Mono<Long> getDlqSize() {
+        return reactiveRedisTemplate.opsForZSet()
+                .size(DLQ_KEY)
+                .defaultIfEmpty(0L);
     }
 
     private QueueItem deserialize(String json) {

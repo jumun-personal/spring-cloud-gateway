@@ -1,5 +1,6 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.pg.toss;
 
+import com.jumunhasyeotjo.gateway.ratelimiter.global.LeakyBucketProperties;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.PaymentProviderRateLimiter;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.Bucket;
@@ -11,13 +12,19 @@ import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 
+/**
+ * Toss PG Rate Limiter - Leaky Bucket
+ * 
+ * capacity = rate로 설정하여 버스트 불허
+ */
 @Component
 @RequiredArgsConstructor
 public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
 
     private final ProxyManager<String> proxyManager;
-    private static final String BUCKET_KEY = "bucket:toss";
-    private static final int RATE_LIMIT = 20;
+    private final LeakyBucketProperties leakyBucketProperties;
+    
+    private static final String BUCKET_KEY = "bucket:toss:leaky";
 
     @Override
     public Mono<Boolean> tryConsume() {
@@ -34,7 +41,7 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
 
     @Override
     public int getRateLimit() {
-        return RATE_LIMIT;
+        return leakyBucketProperties.getPg().getToss().getRate();
     }
 
     @Override
@@ -43,10 +50,14 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
     }
 
     private Bucket getBucket() {
+        int rate = leakyBucketProperties.getPg().getToss().getRate();
+        int capacity = leakyBucketProperties.getPg().getToss().getCapacity();
+        
+        // Leaky Bucket: capacity = rate (버스트 불허)
         BucketConfiguration config = BucketConfiguration.builder()
                 .addLimit(Bandwidth.builder()
-                        .capacity(RATE_LIMIT)
-                        .refillGreedy(RATE_LIMIT, Duration.ofSeconds(1))
+                        .capacity(capacity)
+                        .refillGreedy(rate, Duration.ofSeconds(1))
                         .build())
                 .build();
         return proxyManager.builder().build(BUCKET_KEY, () -> config);

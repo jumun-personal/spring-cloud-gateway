@@ -1,27 +1,50 @@
 package com.jumunhasyeotjo.gateway.ratelimiter;
 
+import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.util.UUID;
 
+/**
+ * 대기열 아이템 - 최소 정보만 저장 (보안 + 메모리)
+ * HTTP Request 전체가 아닌 Command만 저장
+ */
 @Data
 @NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class QueueItem {
     private String requestId;
+    private String command;           // CREATE_ORDER, GET_PRODUCT 등
     private Long userId;
-    private String accessToken;
-    private HttpRequestData httpRequest;
+    private UUID resourceId;          // orderId, productId 등
+    private String idempotencyKey;
     private int retryCount;
     private long originalTimestamp;
 
-    public QueueItem(Long userId, String accessToken, HttpRequestData httpRequest) {
-        this.requestId = UUID.randomUUID().toString();
-        this.userId = userId;
-        this.accessToken = accessToken;
-        this.httpRequest = httpRequest;
-        this.retryCount = 0;
-        this.originalTimestamp = System.currentTimeMillis();
+    public static QueueItem createOrder(Long userId, UUID resourceId, String idempotencyKey) {
+        return QueueItem.builder()
+                .requestId(UUID.randomUUID().toString())
+                .command("CREATE_ORDER")
+                .userId(userId)
+                .resourceId(resourceId)
+                .idempotencyKey(idempotencyKey)
+                .retryCount(0)
+                .originalTimestamp(System.currentTimeMillis())
+                .build();
+    }
+
+    public static QueueItem createGeneric(String command, Long userId, UUID resourceId) {
+        return QueueItem.builder()
+                .requestId(UUID.randomUUID().toString())
+                .command(command)
+                .userId(userId)
+                .resourceId(resourceId)
+                .retryCount(0)
+                .originalTimestamp(System.currentTimeMillis())
+                .build();
     }
 
     public void incrementRetryCount() {

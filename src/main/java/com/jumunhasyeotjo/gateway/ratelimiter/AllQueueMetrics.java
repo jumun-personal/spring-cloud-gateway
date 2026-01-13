@@ -34,8 +34,10 @@ public class AllQueueMetrics {
     // 캐시 - 재시도 큐
     private final AtomicLong cachedOrderRetryQueueSize = new AtomicLong(0);
     private final AtomicLong cachedOtherRetryQueueSize = new AtomicLong(0);
-    // 캐시 - Rate Limit
-    private final AtomicLong cachedGlobalWindowCount = new AtomicLong(0);
+    // 캐시 - DLQ
+    private final AtomicLong cachedDlqSize = new AtomicLong(0);
+    // 캐시 - Rate Limit (Leaky Bucket)
+    private final AtomicLong cachedGlobalWater = new AtomicLong(0);
     private final Map<String, AtomicLong> cachedPgCurrentTokens = new ConcurrentHashMap<>();
 
     @PostConstruct
@@ -62,48 +64,59 @@ public class AllQueueMetrics {
                 .description("Number of requests in OTHER retry queue")
                 .register(meterRegistry);
 
-        // 5. Global Rate Limit - Max
-        Gauge.builder("rate.limit.global.max", globalRateLimiterService,
-                        GlobalRateLimiterService::getCurrentLimit)
-                .description("Global rate limit max (sliding window)")
+        // 5. DLQ
+        Gauge.builder("queue.dlq.size", cachedDlqSize, AtomicLong::get)
+                .description("Number of requests in Dead Letter Queue")
                 .register(meterRegistry);
 
-        // 6. Global Rate Limit - Current Usage
-        Gauge.builder("rate.limit.global.current", cachedGlobalWindowCount, AtomicLong::get)
-                .description("Current requests in global sliding window")
+        // 6. Global Rate Limit - Leaky Bucket Water
+        Gauge.builder("rate.limit.global.water", cachedGlobalWater, AtomicLong::get)
+                .description("Current water level in global leaky bucket")
                 .register(meterRegistry);
 
-        // 7. Global Rate Limit - Usage Ratio
+        // 7. Global Rate Limit - Capacity
+        Gauge.builder("rate.limit.global.capacity", globalRateLimiterService,
+                        GlobalRateLimiterService::getCapacity)
+                .description("Global leaky bucket capacity")
+                .register(meterRegistry);
+
+        // 8. Global Rate Limit - Rate
+        Gauge.builder("rate.limit.global.rate", globalRateLimiterService,
+                        GlobalRateLimiterService::getRate)
+                .description("Global leaky bucket rate (per second)")
+                .register(meterRegistry);
+
+        // 9. Global Rate Limit - Usage Ratio
         Gauge.builder("rate.limit.global.usage", this, metrics -> {
-                    long current = cachedGlobalWindowCount.get();
-                    int max = globalRateLimiterService.getCurrentLimit();
-                    return max > 0 ? (double) current / max * 100 : 0;
+                    long water = cachedGlobalWater.get();
+                    int capacity = globalRateLimiterService.getCapacity();
+                    return capacity > 0 ? (double) water / capacity * 100 : 0;
                 })
-                .description("Global rate limit usage percentage")
+                .description("Global leaky bucket usage percentage")
                 .baseUnit("percent")
                 .register(meterRegistry);
 
-        // 8. PG별 메트릭
+        // 10. PG별 메트릭
         for (PaymentProviderRateLimiter rateLimiter : paymentProviderRateLimiters) {
             String provider = rateLimiter.getProviderName();
 
-            Gauge.builder("rate.limit.pg." + provider + ".max", rateLimiter,
+            Gauge.builder("rate.limit.pg." + provider + ".rate", rateLimiter,
                             PaymentProviderRateLimiter::getRateLimit)
-                    .description("PG rate limit max tokens")
+                    .description("PG leaky bucket rate")
                     .register(meterRegistry);
 
             cachedPgCurrentTokens.put(provider, new AtomicLong(0));
 
-            Gauge.builder("rate.limit.pg." + provider + ".current",
+            Gauge.builder("rate.limit.pg." + provider + ".available",
                             cachedPgCurrentTokens.get(provider),
                             AtomicLong::get)
                     .description("PG current available tokens")
                     .register(meterRegistry);
 
             Gauge.builder("rate.limit.pg." + provider + ".usage", this, metrics -> {
-                        long current = cachedPgCurrentTokens.get(provider).get();
+                        long available = cachedPgCurrentTokens.get(provider).get();
                         int max = rateLimiter.getRateLimit();
-                        return max > 0 ? (double) (max - current) / max * 100 : 0;
+                        return max > 0 ? (double) (max - available) / max * 100 : 0;
                     })
                     .description("PG rate limit usage percentage")
                     .baseUnit("percent")
@@ -114,15 +127,12 @@ public class AllQueueMetrics {
     }
 
     @Scheduled(fixedDelay = 5000, initialDelay = 2000)
-    public void updateGlobalQueueSize() {
+    public void updateQueueSizes() {
         // ORDER 큐
         globalQueueService.getQueueSize(QueueType.ORDER)
                 .timeout(Duration.ofSeconds(3))
                 .subscribe(
-                        size -> {
-                            cachedGlobalOrderQueueSize.set(size);
-                            log.debug("Global ORDER queue: {}", size);
-                        },
+                        size -> cachedGlobalOrderQueueSize.set(size),
                         error -> log.warn("Failed to update global ORDER queue size: {}", error.getMessage())
                 );
 
@@ -130,10 +140,7 @@ public class AllQueueMetrics {
         globalQueueService.getQueueSize(QueueType.OTHER)
                 .timeout(Duration.ofSeconds(3))
                 .subscribe(
-                        size -> {
-                            cachedGlobalOtherQueueSize.set(size);
-                            log.debug("Global OTHER queue: {}", size);
-                        },
+                        size -> cachedGlobalOtherQueueSize.set(size),
                         error -> log.warn("Failed to update global OTHER queue size: {}", error.getMessage())
                 );
 
@@ -141,10 +148,7 @@ public class AllQueueMetrics {
         globalQueueService.getRetryQueueSize(QueueType.ORDER)
                 .timeout(Duration.ofSeconds(3))
                 .subscribe(
-                        size -> {
-                            cachedOrderRetryQueueSize.set(size);
-                            log.debug("ORDER retry queue: {}", size);
-                        },
+                        size -> cachedOrderRetryQueueSize.set(size),
                         error -> log.warn("Failed to update ORDER retry queue size: {}", error.getMessage())
                 );
 
@@ -152,31 +156,41 @@ public class AllQueueMetrics {
         globalQueueService.getRetryQueueSize(QueueType.OTHER)
                 .timeout(Duration.ofSeconds(3))
                 .subscribe(
-                        size -> {
-                            cachedOtherRetryQueueSize.set(size);
-                            log.debug("OTHER retry queue: {}", size);
-                        },
+                        size -> cachedOtherRetryQueueSize.set(size),
                         error -> log.warn("Failed to update OTHER retry queue size: {}", error.getMessage())
+                );
+
+        // DLQ
+        globalQueueService.getDlqSize()
+                .timeout(Duration.ofSeconds(3))
+                .subscribe(
+                        size -> {
+                            cachedDlqSize.set(size);
+                            if (size > 0) {
+                                log.warn("DLQ size: {} - requires attention!", size);
+                            }
+                        },
+                        error -> log.warn("Failed to update DLQ size: {}", error.getMessage())
                 );
     }
 
     @Scheduled(fixedDelay = 1000, initialDelay = 1000)
-    public void updateGlobalWindowCount() {
-        globalRateLimiterService.getCurrentWindowCount()
+    public void updateGlobalWater() {
+        globalRateLimiterService.getCurrentWater()
                 .timeout(Duration.ofSeconds(2))
                 .subscribe(
-                        count -> {
-                            cachedGlobalWindowCount.set(count);
-                            int limit = globalRateLimiterService.getCurrentLimit();
-                            double usage = limit > 0 ? (double) count / limit * 100 : 0;
-                            log.info("Global: {}/{} ({}%)", count, limit, String.format("%.1f", usage));
+                        water -> {
+                            cachedGlobalWater.set(water);
+                            int capacity = globalRateLimiterService.getCapacity();
+                            double usage = capacity > 0 ? (double) water / capacity * 100 : 0;
+                            log.debug("Global Leaky Bucket: {}/{} ({}%)", water, capacity, String.format("%.1f", usage));
                         },
-                        error -> log.warn("Failed to update global window count: {}", error.getMessage())
+                        error -> log.warn("Failed to update global water: {}", error.getMessage())
                 );
     }
 
     @Scheduled(fixedDelay = 2000, initialDelay = 1500)
-    public void updatePgCurrentTokens() {
+    public void updatePgTokens() {
         for (PaymentProviderRateLimiter rateLimiter : paymentProviderRateLimiters) {
             String provider = rateLimiter.getProviderName();
 
@@ -186,9 +200,8 @@ public class AllQueueMetrics {
                             available -> {
                                 cachedPgCurrentTokens.get(provider).set(available);
                                 int max = rateLimiter.getRateLimit();
-                                long used = max - available;
-                                double usage = max > 0 ? (double) used / max * 100 : 0;
-                                log.debug("PG {}: {}/{} used ({}%)", provider, used, max, String.format("%.1f", usage));
+                                double usage = max > 0 ? (double) (max - available) / max * 100 : 0;
+                                log.debug("PG {}: available={}, usage={}%", provider, available, String.format("%.1f", usage));
                             },
                             error -> log.warn("Failed to get PG {} tokens: {}", provider, error.getMessage())
                     );

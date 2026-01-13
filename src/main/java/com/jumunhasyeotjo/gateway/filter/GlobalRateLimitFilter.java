@@ -5,27 +5,23 @@ import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalRateLimiterService;
-import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import io.jsonwebtoken.Claims;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
-import org.springframework.core.io.buffer.DataBuffer;
-import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
-import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.UUID;
 
 @Slf4j
 @Component
@@ -45,7 +41,8 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
             return chain.filter(exchange);
         }
 
-        return rateLimiterService.tryConsume()
+        // 신규 요청: 대기열 비어있고 토큰 있을 때만 통과
+        return rateLimiterService.tryConsumeForNewRequest()
                 .flatMap(hasToken -> {
                     if (hasToken) {
                         log.debug("Request passed rate limit: {}", path);
@@ -59,21 +56,22 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
 
     private Mono<Void> addToGlobalQueue(ServerWebExchange exchange) {
         Long userId = extractUserId(exchange);
-        String accessToken = extractAccessToken(exchange);
+        String idempotencyKey = exchange.getRequest().getHeaders().getFirst("x-idempotency-key");
         String uri = exchange.getRequest().getURI().toString();
         HttpMethod method = exchange.getRequest().getMethod();
-        QueueType queueType = queueService.resolveQueueType(method,uri);
+        QueueType queueType = queueService.resolveQueueType(method, uri);
 
         log.info("Adding to {} queue: userId={}", queueType, userId);
 
-        return captureRequest(exchange)
-                .doOnNext(req -> log.debug("Captured request: method={}, uri={}, bodyLen={}",
-                        req.getMethod(), req.getUri(), req.getBody() != null ? req.getBody().length() : 0))
-                .flatMap(httpRequest -> {
-                    QueueItem item = new QueueItem(userId, accessToken, httpRequest);
-                    return queueService.offer(item, queueType);
-                })
-                .doOnNext(added -> log.debug("Queue offer result: {}", added))
+        // Command 기반 QueueItem 생성 (최소 정보만)
+        QueueItem item;
+        if (queueType == QueueType.ORDER) {
+            item = QueueItem.createOrder(userId, UUID.randomUUID(), idempotencyKey);
+        } else {
+            item = QueueItem.createGeneric("OTHER_REQUEST", userId, null);
+        }
+
+        return queueService.offer(item, queueType)
                 .flatMap(added -> queueService.findSequence(userId, queueType))
                 .flatMap(sequence -> {
                     ServerHttpResponse response = exchange.getResponse();
@@ -81,8 +79,8 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
                     response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
                     String body = String.format(
-                            "{\"status\":\"queued\",\"queueType\":\"%s\",\"position\":%d,\"currentLimit\":%d}",
-                            queueType.name(), sequence, rateLimiterService.getCurrentLimit()
+                            "{\"status\":\"queued\",\"queueType\":\"%s\",\"position\":%d,\"requestId\":\"%s\"}",
+                            queueType.name(), sequence, item.getRequestId()
                     );
 
                     DataBuffer buffer = response.bufferFactory()
@@ -93,6 +91,16 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
                 .onErrorResume(e -> {
                     log.error("Error adding to global queue", e);
                     ServerHttpResponse response = exchange.getResponse();
+                    
+                    // 대기열 가득 참 에러 처리
+                    if (e.getMessage() != null && e.getMessage().contains("대기열이 가득")) {
+                        response.setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
+                        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                        String body = "{\"error\":\"QUEUE_FULL\",\"message\":\"대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요.\"}";
+                        DataBuffer buffer = response.bufferFactory().wrap(body.getBytes(StandardCharsets.UTF_8));
+                        return response.writeWith(Mono.just(buffer));
+                    }
+                    
                     response.setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
                     return response.setComplete();
                 });
@@ -111,38 +119,8 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
             return claims.get("userId", Long.class);
         } catch (Exception e) {
             log.error("Failed to extract userId from JWT", e);
-            return null;
+            return 0L;
         }
-    }
-
-    private String extractAccessToken(ServerWebExchange exchange) {
-        String auth = exchange.getRequest().getHeaders().getFirst("Authorization");
-        return auth != null ? auth.replace("Bearer ", "") : null;
-    }
-
-    private Mono<HttpRequestData> captureRequest(ServerWebExchange exchange) {
-        ServerHttpRequest request = exchange.getRequest();
-
-        Map<String, String> headers = new HashMap<>();
-        request.getHeaders().forEach((key, values) ->
-                headers.put(key, String.join(",", values))
-        );
-
-        return DataBufferUtils.join(request.getBody())
-                .map(dataBuffer -> {
-                    byte[] bytes = new byte[dataBuffer.readableByteCount()];
-                    dataBuffer.read(bytes);
-                    DataBufferUtils.release(dataBuffer);
-
-                    return new String(bytes, StandardCharsets.UTF_8);
-                })
-                .defaultIfEmpty("")
-                .map(body -> new HttpRequestData(
-                        request.getMethod().name(),
-                        request.getURI().toString(),
-                        headers,
-                        body
-                ));
     }
 
     @Override
