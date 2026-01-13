@@ -78,9 +78,9 @@ public class GlobalQueueProcessor {
         local retryThreshold = tonumber(ARGV[5])
         
         local result = {
-            orderRetry  = {}
-            orderNormal = {}
-            otherRetry  = {}
+            orderRetry = {},
+            orderNormal = {},
+            otherRetry = {},
             otherNormal = {}
         }
         
