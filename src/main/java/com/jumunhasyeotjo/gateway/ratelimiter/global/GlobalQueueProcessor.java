@@ -1,5 +1,6 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
@@ -226,26 +227,14 @@ public class GlobalQueueProcessor {
                 .flatMap(result -> {
                     try {
 
-                        // Lua 스크립트 결과를 Map<String, List<String>> 형태로 먼저 읽기
-                        Map<String, List<String>> parsed = objectMapper.readValue(
-                                result, new TypeReference<Map<String, List<String>>>() {});
+                        Map<String, Object> parsed = objectMapper.readValue(
+                                result, new TypeReference<Map<String, Object>>() {});
 
-
-                        // 각 QueueItem JSON 문자열을 실제 QueueItem으로 변환
-                        List<QueueItem> orderRetry  = parsed.getOrDefault("orderRetry", List.of())
-                                .stream().map(this::deserialize).toList();
-                        List<QueueItem> orderNormal = parsed.getOrDefault("orderNormal", List.of())
-                                .stream().map(this::deserialize).toList();
-                        List<QueueItem> otherRetry  = parsed.getOrDefault("otherRetry", List.of())
-                                .stream().map(this::deserialize).toList();
-                        List<QueueItem> otherNormal = parsed.getOrDefault("otherNormal", List.of())
-                                .stream().map(this::deserialize).toList();
-
-                        log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
-                                orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
-
-                        log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
-                                orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
+                        // 각 항목을 QueueItem 리스트로 변환
+                        List<QueueItem> orderRetry = toQueueItemList(parsed.get("orderRetry"));
+                        List<QueueItem> orderNormal = toQueueItemList(parsed.get("orderNormal"));
+                        List<QueueItem> otherRetry = toQueueItemList(parsed.get("otherRetry"));
+                        List<QueueItem> otherNormal = toQueueItemList(parsed.get("otherNormal"));
 
                         return processItems(orderRetry, QueueType.ORDER, true)
                                 .then(processItems(orderNormal, QueueType.ORDER, false))
@@ -257,6 +246,25 @@ public class GlobalQueueProcessor {
                         return Mono.empty();
                     }
                 });
+    }
+
+    private List<QueueItem> toQueueItemList(Object obj) throws JsonProcessingException {
+        if (obj == null) return List.of();
+
+        if (obj instanceof List<?> list) {
+            // 이미 리스트라면 바로 변환
+            return list.stream()
+                    .map(o -> objectMapper.convertValue(o, QueueItem.class))
+                    .toList();
+        } else if (obj instanceof Map<?, ?> map) {
+            // 빈 Map일 경우 빈 리스트 반환
+            return List.of();
+        } else if (obj instanceof String s) {
+            // Lua에서 JSON 문자열로 반환한 경우
+            return List.of(objectMapper.readValue(s, QueueItem.class));
+        } else {
+            return List.of();
+        }
     }
 
     private Mono<Void> processItems(List<QueueItem> items, QueueType queueType, boolean isRetry) {
