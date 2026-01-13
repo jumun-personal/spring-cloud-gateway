@@ -66,6 +66,8 @@ public class GlobalQueueProcessor {
      * 가중치 기반 큐 처리 Lua Script
      */
     private static final String WEIGHTED_POLL_LUA = """
+        cjson.encode_empty_table_as_object(false)
+        
         local orderQueueKey = KEYS[1]
         local otherQueueKey = KEYS[2]
         local orderRetryKey = KEYS[3]
