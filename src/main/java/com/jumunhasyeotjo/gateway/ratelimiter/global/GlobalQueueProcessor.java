@@ -75,10 +75,10 @@ public class GlobalQueueProcessor {
         local retryThreshold = tonumber(ARGV[5])
         
         local result = {
-            orderRetry = {},
-            orderNormal = {},
-            otherRetry = {},
-            otherNormal = {}
+            orderRetry  = cjson.empty_array,
+            orderNormal = cjson.empty_array,
+            otherRetry  = cjson.empty_array,
+            otherNormal = cjson.empty_array
         }
         
         -- 가중치 계산
@@ -211,10 +211,10 @@ public class GlobalQueueProcessor {
                         Map<String, List<String>> parsed = objectMapper.readValue(
                                 result, new TypeReference<Map<String, List<String>>>() {});
 
-                        List<String> orderRetry = parsed.get("orderRetry");
-                        List<String> orderNormal = parsed.get("orderNormal");
-                        List<String> otherRetry = parsed.get("otherRetry");
-                        List<String> otherNormal = parsed.get("otherNormal");
+                        List<String> orderRetry = parsed.getOrDefault("orderRetry", List.of());
+                        List<String> orderNormal = parsed.getOrDefault("orderNormal", List.of());
+                        List<String> otherRetry = parsed.getOrDefault("otherRetry", List.of());
+                        List<String> otherNormal = parsed.getOrDefault("otherNormal", List.of());
 
                         log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
                                 orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
