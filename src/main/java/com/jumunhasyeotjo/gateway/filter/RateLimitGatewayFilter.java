@@ -3,9 +3,8 @@ package com.jumunhasyeotjo.gateway.filter;
 import com.jumunhasyeotjo.gateway.jwt.JwtProvider;
 import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
-import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService;
-import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
-import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalRateLimiterService;
+import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
+import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRedisQueueService;
 import io.jsonwebtoken.Claims;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,7 +13,6 @@ import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
@@ -26,90 +24,78 @@ import reactor.core.publisher.Mono;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
+public class RateLimitGatewayFilter implements GlobalFilter, Ordered {
 
-    private final GlobalRateLimiterService rateLimiterService;
-    private final GlobalQueueService queueService;
+    private final ReactiveRateLimiterService rateLimiterService;
+    private final ReactiveRedisQueueService queueService;
     private final JwtProvider jwtProvider;
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         String path = exchange.getRequest().getURI().getPath();
 
-        // /api/v1/orders만 체크
-        if (!path.startsWith("/api/v1/orders")) {
+        // /api/v1/orders/bf만 체크
+        if (!path.startsWith("/api/v1/orders/bf")) {
             return chain.filter(exchange);
         }
 
-        // 신규 요청: 대기열 비어있고 토큰 있을 때만 통과
-        return rateLimiterService.tryConsumeForNewRequest()
+        // provider 파라미터 추출
+        String provider = exchange.getRequest().getQueryParams().getFirst("provider");
+        if (provider == null) {
+            provider = "TOSS"; // 기본값
+        }
+
+        String finalProvider = provider;
+        return rateLimiterService.tryConsume(provider)
                 .flatMap(hasToken -> {
                     if (hasToken) {
                         log.debug("Request passed rate limit: {}", path);
                         return chain.filter(exchange);
                     }
 
-                    log.info("Request rate limited, adding to global queue: {}", path);
-                    return addToGlobalQueue(exchange);
+                    log.info("Request rate limited, adding to queue: {}", path);
+                    return addToQueue(exchange, finalProvider);
+                })
+                .onErrorResume(e -> {
+                    log.error("Error in rate limit filter", e);
+                    return chain.filter(exchange);
                 });
     }
 
-    private Mono<Void> addToGlobalQueue(ServerWebExchange exchange) {
-        Long userId = extractUserId(exchange);
-        String uri = exchange.getRequest().getURI().toString();
+    private Mono<Void> addToQueue(ServerWebExchange exchange, String provider) {
         String accessToken = extractAccessToken(exchange);
-        HttpMethod method = exchange.getRequest().getMethod();
-        QueueType queueType = queueService.resolveQueueType(method, uri);
-
-        log.info("Adding to {} queue: userId={}", queueType, userId);
-
-        // Command 기반 QueueItem 생성 (최소 정보만)
-        if (queueType == QueueType.ORDER) {
-            return Mono.empty();
-        }
+        Long userId = extractUserId(exchange);
+        String idempotencyKey = exchange.getRequest().getHeaders().getFirst("x-idempotency-key");
 
         return captureRequest(exchange)
-                .doOnNext(req -> log.debug("Captured request: method={}, uri={}, bodyLen={}",
-                        req.getMethod(), req.getUri(), req.getBody() != null ? req.getBody().length() : 0))
                 .flatMap(httpRequest -> {
-                    QueueItem item = QueueItem.createGeneric("OTHER_REQUEST", userId, null, httpRequest, accessToken);
-                    return queueService.offer(item, queueType);
+                    QueueItem item = QueueItem.createOrder(userId, UUID.randomUUID(), idempotencyKey, httpRequest, accessToken);
+                    return queueService.offer(item);
                 })
-                .flatMap(added -> queueService.findSequence(userId, queueType))
+                .flatMap(added -> queueService.findSequence(userId))
                 .flatMap(sequence -> {
+                    // 새로운 ServerHttpResponse로 응답 생성
                     ServerHttpResponse response = exchange.getResponse();
+
+                    // 상태 코드 설정
                     response.setStatusCode(HttpStatus.ACCEPTED);
+
+                    // 헤더는 getMutableHeaders()로 수정 가능한 헤더 가져오기
                     response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
-                    String body = String.format(
-                            "{\"status\":\"queued\",\"queueType\":\"%s\",\"position\":%d }",
-                            queueType.name(), sequence
-                    );
+                    String body = """
+                        {"status":"queued"}
+                        """;
 
                     DataBuffer buffer = response.bufferFactory()
                             .wrap(body.getBytes(StandardCharsets.UTF_8));
 
                     return response.writeWith(Mono.just(buffer));
-                })
-                .onErrorResume(e -> {
-                    log.error("Error adding to global queue", e);
-                    ServerHttpResponse response = exchange.getResponse();
-
-                    // 대기열 가득 참 에러 처리
-                    if (e.getMessage() != null && e.getMessage().contains("대기열이 가득")) {
-                        response.setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
-                        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-                        String body = "{\"error\":\"QUEUE_FULL\",\"message\":\"대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요.\"}";
-                        DataBuffer buffer = response.bufferFactory().wrap(body.getBytes(StandardCharsets.UTF_8));
-                        return response.writeWith(Mono.just(buffer));
-                    }
-
-                    response.setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
-                    return response.setComplete();
                 });
     }
 
@@ -126,7 +112,7 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
             return claims.get("userId", Long.class);
         } catch (Exception e) {
             log.error("Failed to extract userId from JWT", e);
-            return 0L;
+            return null;
         }
     }
 
@@ -162,6 +148,6 @@ public class GlobalRateLimitFilter implements GlobalFilter, Ordered {
 
     @Override
     public int getOrder() {
-        return -2;
+        return -1;
     }
 }

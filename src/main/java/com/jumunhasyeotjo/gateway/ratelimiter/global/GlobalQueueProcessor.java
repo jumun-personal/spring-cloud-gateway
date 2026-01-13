@@ -2,6 +2,7 @@ package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
@@ -18,12 +19,14 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.ConnectException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -286,21 +289,45 @@ public class GlobalQueueProcessor {
         return Mono.empty();
     }
 
+    private String extractPath(String uri) {
+        try {
+            URI parsed = new URI(uri);
+            String path = parsed.getPath();
+            String query = parsed.getQuery();
+            return query != null ? path + "?" + query : path;
+        } catch (Exception e) {
+            return uri;
+        }
+    }
+
     private Mono<Void> executeOrderRequest(QueueItem item, QueueType queueType, boolean isRetry, long waitTimeMs) {
+        HttpRequestData request = item.getHttpRequest();
+        if (request == null) {
+            log.warn("Invalid request data for userId={}", item.getUserId());
+            return Mono.empty();
+        }
+
+        URI original = URI.create(request.getUri());
+
         return webClient
-                .method(HttpMethod.POST)
+                .method(HttpMethod.valueOf(request.getMethod()))
                 .uri(uriBuilder -> uriBuilder
                         .scheme("lb")
                         .host("order-to-shipping-service")
-                        .path("/api/v1/orders/bf/queue")
+                        .path(original.getPath())
+                        .query(original.getQuery())
                         .queryParam("provider", DEFAULT_PROVIDER)
-                        .build())
-                .headers(headers -> headers.setContentType(MediaType.APPLICATION_JSON))
-                .bodyValue(new QueueOrderRequest(
-                        item.getUserId(),
-                        item.getResourceId(),
-                        item.getIdempotencyKey()
-                ))
+                        .build(true))
+                .headers(headers -> {
+                    headers.setContentType(MediaType.APPLICATION_JSON);
+                    if (request.getHeaders() != null) {
+                        request.getHeaders().forEach(headers::add);
+                    }
+                    if (item.getAccessToken() != null) {
+                        headers.set("Authorization", "Bearer " + item.getAccessToken());
+                    }
+                })
+                .body(request.getBody() != null ? BodyInserters.fromValue(request.getBody()) : BodyInserters.empty())
                 .retrieve()
                 .onStatus(status -> status.is5xxServerError(),
                         response -> Mono.error(new RuntimeException("Server error: " + response.statusCode())))

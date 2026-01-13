@@ -23,8 +23,10 @@ public class QueueItem {
     private String idempotencyKey;
     private int retryCount;
     private long originalTimestamp;
+    private HttpRequestData httpRequest;
+    private String accessToken;
 
-    public static QueueItem createOrder(Long userId, UUID resourceId, String idempotencyKey) {
+    public static QueueItem createOrder(Long userId, UUID resourceId, String idempotencyKey, HttpRequestData httpRequestData, String accessToken) {
         return QueueItem.builder()
                 .requestId(UUID.randomUUID().toString())
                 .command("CREATE_ORDER")
@@ -33,10 +35,12 @@ public class QueueItem {
                 .idempotencyKey(idempotencyKey)
                 .retryCount(0)
                 .originalTimestamp(System.currentTimeMillis())
+                .httpRequest(httpRequestData)
+                .accessToken(accessToken)
                 .build();
     }
 
-    public static QueueItem createGeneric(String command, Long userId, UUID resourceId) {
+    public static QueueItem createGeneric(String command, Long userId, UUID resourceId, HttpRequestData httpRequestData, String accessToken) {
         return QueueItem.builder()
                 .requestId(UUID.randomUUID().toString())
                 .command(command)
@@ -44,6 +48,8 @@ public class QueueItem {
                 .resourceId(resourceId)
                 .retryCount(0)
                 .originalTimestamp(System.currentTimeMillis())
+                .httpRequest(httpRequestData)
+                .accessToken(accessToken)
                 .build();
     }
 
