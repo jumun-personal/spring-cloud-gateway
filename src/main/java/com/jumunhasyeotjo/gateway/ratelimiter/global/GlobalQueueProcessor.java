@@ -32,6 +32,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -248,24 +249,35 @@ public class GlobalQueueProcessor {
                 });
     }
 
-    private List<QueueItem> toQueueItemList(Object obj) throws JsonProcessingException {
+    private List<QueueItem> toQueueItemList(Object obj) {
         if (obj == null) return List.of();
 
         if (obj instanceof List<?> list) {
-            // 이미 리스트라면 바로 변환
             return list.stream()
-                    .map(o -> objectMapper.convertValue(o, QueueItem.class))
+                    .map(o -> {
+                        try {
+                            // Lua에서 가져온 JSON 문자열이면 읽어와서 QueueItem으로 변환
+                            if (o instanceof String s) {
+                                return objectMapper.readValue(s, QueueItem.class);
+                            } else {
+                                // 이미 Map이면 convertValue로 변환
+                                return objectMapper.convertValue(o, QueueItem.class);
+                            }
+                        } catch (Exception e) {
+                            log.error("Failed to deserialize QueueItem: {}", o, e);
+                            return null;
+                        }
+                    })
+                    .filter(Objects::nonNull)
                     .toList();
-        } else if (obj instanceof Map<?, ?> map) {
-            // 빈 Map일 경우 빈 리스트 반환
+        } else if (obj instanceof Map<?, ?>) {
+            // 빈 Map이면 빈 리스트 반환
             return List.of();
-        } else if (obj instanceof String s) {
-            // Lua에서 JSON 문자열로 반환한 경우
-            return List.of(objectMapper.readValue(s, QueueItem.class));
         } else {
             return List.of();
         }
     }
+
 
     private Mono<Void> processItems(List<QueueItem> items, QueueType queueType, boolean isRetry) {
         if (items == null || items.isEmpty()) {
