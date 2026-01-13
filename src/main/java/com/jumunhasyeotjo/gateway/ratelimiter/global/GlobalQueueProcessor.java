@@ -89,72 +89,74 @@ public class GlobalQueueProcessor {
         local orderSlots = math.ceil(totalSlots * orderWeight / totalWeight)
         local otherSlots = totalSlots - orderSlots
         
-        -- ORDER 슬롯 내 retry/normal 분배 (retry 우선, 7:3)
         local orderRetrySlots = math.ceil(orderSlots * retryRatio)
         local orderNormalSlots = orderSlots - orderRetrySlots
         
-        -- OTHER 슬롯 내 retry/normal 분배
         local otherRetrySlots = math.ceil(otherSlots * retryRatio)
         local otherNormalSlots = otherSlots - otherRetrySlots
         
-        -- 1. ORDER retry (eligible만)
-        if orderRetrySlots > 0 then
-            local items = redis.call('ZRANGEBYSCORE', orderRetryKey, 0, retryThreshold, 'LIMIT', 0, orderRetrySlots)
-            if #items > 0 then
-                for _, item in ipairs(items) do
-                    table.insert(result.orderRetry, item)
-                end
-                redis.call('ZREM', orderRetryKey, unpack(items))
+        -- 헬퍼: Redis ZRANGEBYSCORE/ZRANGE 결과를 항상 array로 반환
+        local function safeFetch(key, scoreMin, scoreMax, limit)
+            local items
+            if scoreMin and scoreMax then
+                items = redis.call('ZRANGEBYSCORE', key, scoreMin, scoreMax, 'LIMIT', 0, limit)
+            else
+                items = redis.call('ZRANGE', key, 0, limit - 1)
             end
+            if items == nil then items = {} end
+            return items
+        end
+        
+        -- 1. ORDER retry
+        if orderRetrySlots > 0 then
+            local items = safeFetch(orderRetryKey, 0, retryThreshold, orderRetrySlots)
+            for i=1,#items do
+                table.insert(result.orderRetry, items[i])
+            end
+            if #items > 0 then redis.call('ZREM', orderRetryKey, unpack(items)) end
             orderNormalSlots = orderNormalSlots + (orderRetrySlots - #items)
         end
         
         -- 2. ORDER normal
         if orderNormalSlots > 0 then
-            local items = redis.call('ZRANGE', orderQueueKey, 0, orderNormalSlots - 1)
-            if #items > 0 then
-                for _, item in ipairs(items) do
-                    table.insert(result.orderNormal, item)
-                end
-                redis.call('ZREM', orderQueueKey, unpack(items))
+            local items = safeFetch(orderQueueKey, nil, nil, orderNormalSlots)
+            for i=1,#items do
+                table.insert(result.orderNormal, items[i])
             end
+            if #items > 0 then redis.call('ZREM', orderQueueKey, unpack(items)) end
         end
         
-        -- 3. OTHER retry (eligible만)
+        -- 3. OTHER retry
         if otherRetrySlots > 0 then
-            local items = redis.call('ZRANGEBYSCORE', otherRetryKey, 0, retryThreshold, 'LIMIT', 0, otherRetrySlots)
-            if #items > 0 then
-                for _, item in ipairs(items) do
-                    table.insert(result.otherRetry, item)
-                end
-                redis.call('ZREM', otherRetryKey, unpack(items))
+            local items = safeFetch(otherRetryKey, 0, retryThreshold, otherRetrySlots)
+            for i=1,#items do
+                table.insert(result.otherRetry, items[i])
             end
+            if #items > 0 then redis.call('ZREM', otherRetryKey, unpack(items)) end
             otherNormalSlots = otherNormalSlots + (otherRetrySlots - #items)
         end
         
         -- 4. OTHER normal
         if otherNormalSlots > 0 then
-            local items = redis.call('ZRANGE', otherQueueKey, 0, otherNormalSlots - 1)
-            if #items > 0 then
-                for _, item in ipairs(items) do
-                    table.insert(result.otherNormal, item)
-                end
-                redis.call('ZREM', otherQueueKey, unpack(items))
+            local items = safeFetch(otherQueueKey, nil, nil, otherNormalSlots)
+            for i=1,#items do
+                table.insert(result.otherNormal, items[i])
             end
+            if #items > 0 then redis.call('ZREM', otherQueueKey, unpack(items)) end
         end
         
-        local function emptyArrayIfNil(t)
-            if t == nil or #t == 0 then
-                return {}  -- 항상 numeric array
-            end
-            return t
+        -- 항상 numeric array로 변환
+        local function toArray(t)
+            local arr = {}
+            for i=1,#t do arr[i] = t[i] end
+            return arr
         end
         
         return cjson.encode({
-            orderRetry  = emptyArrayIfNil(result.orderRetry),
-            orderNormal = emptyArrayIfNil(result.orderNormal),
-            otherRetry  = emptyArrayIfNil(result.otherRetry),
-            otherNormal = emptyArrayIfNil(result.otherNormal)
+            orderRetry  = toArray(result.orderRetry),
+            orderNormal = toArray(result.orderNormal),
+            otherRetry  = toArray(result.otherRetry),
+            otherNormal = toArray(result.otherNormal)
         })
         """;
 
@@ -223,21 +225,24 @@ public class GlobalQueueProcessor {
                 .next()
                 .flatMap(result -> {
                     try {
-                        Map<String, Object> parsed =
-                                objectMapper.readValue(result, new TypeReference<Map<String, Object>>() {});
 
-                        List<String> orderRetry = parsed.containsKey("orderRetry")
-                                ? objectMapper.convertValue(parsed.get("orderRetry"), new TypeReference<List<String>>() {})
-                                : List.of();
-                        List<String> orderNormal = parsed.containsKey("orderNormal")
-                                ? objectMapper.convertValue(parsed.get("orderNormal"), new TypeReference<List<String>>() {})
-                                : List.of();
-                        List<String> otherRetry = parsed.containsKey("otherRetry")
-                                ? objectMapper.convertValue(parsed.get("otherRetry"), new TypeReference<List<String>>() {})
-                                : List.of();
-                        List<String> otherNormal = parsed.containsKey("otherNormal")
-                                ? objectMapper.convertValue(parsed.get("otherNormal"), new TypeReference<List<String>>() {})
-                                : List.of();
+                        // Lua 스크립트 결과를 Map<String, List<String>> 형태로 먼저 읽기
+                        Map<String, List<String>> parsed = objectMapper.readValue(
+                                result, new TypeReference<Map<String, List<String>>>() {});
+
+
+                        // 각 QueueItem JSON 문자열을 실제 QueueItem으로 변환
+                        List<QueueItem> orderRetry  = parsed.getOrDefault("orderRetry", List.of())
+                                .stream().map(this::deserialize).toList();
+                        List<QueueItem> orderNormal = parsed.getOrDefault("orderNormal", List.of())
+                                .stream().map(this::deserialize).toList();
+                        List<QueueItem> otherRetry  = parsed.getOrDefault("otherRetry", List.of())
+                                .stream().map(this::deserialize).toList();
+                        List<QueueItem> otherNormal = parsed.getOrDefault("otherNormal", List.of())
+                                .stream().map(this::deserialize).toList();
+
+                        log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
+                                orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
 
                         log.debug("Processing - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
                                 orderRetry.size(), orderNormal.size(), otherRetry.size(), otherNormal.size());
@@ -254,13 +259,12 @@ public class GlobalQueueProcessor {
                 });
     }
 
-    private Mono<Void> processItems(List<String> items, QueueType queueType, boolean isRetry) {
+    private Mono<Void> processItems(List<QueueItem> items, QueueType queueType, boolean isRetry) {
         if (items == null || items.isEmpty()) {
             return Mono.empty();
         }
 
         return Flux.fromIterable(items)
-                .map(this::deserialize)
                 .flatMap(item -> processItem(item, queueType, isRetry), 1)
                 .then();
     }
