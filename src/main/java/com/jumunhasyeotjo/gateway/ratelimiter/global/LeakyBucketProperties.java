@@ -12,8 +12,8 @@ public class LeakyBucketProperties {
 
     @Data
     public static class Global {
-        private volatile int rate = 30;        // 초당 처리량
-        private volatile int capacity = 30;    // = rate (버스트 불허)
+        private volatile int rate = 15;        // 초당 처리량
+        private volatile int capacity = 15;    // = rate (버스트 불허)
         
         // Feedback Loop에서 동적 변경 가능
         public synchronized void setRate(int rate) {
@@ -31,8 +31,8 @@ public class LeakyBucketProperties {
 
         @Data
         public static class Toss {
-            private int rate = 30;
-            private int capacity = 30;
+            private int rate = 10;
+            private int capacity = 10;
         }
     }
 }
