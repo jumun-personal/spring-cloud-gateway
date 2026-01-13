@@ -78,10 +78,10 @@ public class GlobalQueueProcessor {
         local retryThreshold = tonumber(ARGV[5])
         
         local result = {
-            orderRetry  = cjson.empty_array,
-            orderNormal = cjson.empty_array,
-            otherRetry  = cjson.empty_array,
-            otherNormal = cjson.empty_array
+            orderRetry  = {}
+            orderNormal = {}
+            otherRetry  = {}
+            otherNormal = {}
         }
         
         -- 가중치 계산
