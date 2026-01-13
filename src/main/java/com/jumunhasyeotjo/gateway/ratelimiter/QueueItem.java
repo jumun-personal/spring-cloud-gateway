@@ -7,10 +7,6 @@ import lombok.NoArgsConstructor;
 
 import java.util.UUID;
 
-/**
- * 대기열 아이템 - 최소 정보만 저장 (보안 + 메모리)
- * HTTP Request 전체가 아닌 Command만 저장
- */
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
