@@ -18,6 +18,29 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * 대기열 시스템 메트릭
+ *
+ * === 대기열 관련 ===
+ * queue.waiting.users.global.order  - ORDER 대기열 크기
+ * queue.waiting.users.global.other  - OTHER 대기열 크기
+ * queue.retry.order                 - ORDER 재시도 큐 크기
+ * queue.retry.other                 - OTHER 재시도 큐 크기
+ * queue.dlq.size                    - DLQ 크기
+ *
+ * === 처리 결과 (GlobalQueueProcessor에서 등록) ===
+ * queue.wait.time                   - 대기 시간 히스토그램 (P50, P75, P95, P99)
+ * queue.process.first_attempt.success - 첫 시도 성공 수
+ * queue.process.retry.success       - 재시도 성공 수 (retry_count 태그)
+ * queue.process.retry.fail          - 재시도 실패 수 (DLQ 이동)
+ * queue.process.non_retryable.fail  - 재시도 불가 실패 수
+ *
+ * === Rate Limit ===
+ * rate.limit.global.water           - Leaky Bucket 현재 물 양
+ * rate.limit.global.capacity        - Leaky Bucket 용량
+ * rate.limit.global.rate            - 초당 처리량
+ * rate.limit.global.usage           - 사용률 (%)
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
