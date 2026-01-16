@@ -53,6 +53,11 @@ class LeakyBucketRateLimiterTest {
 
     @SuppressWarnings("unchecked")
     private void mockRedisExecute(long returnValue) {
+        // GlobalRateLimiterService: 5 KEYS + 5 ARGV
+        lenient().doReturn(Flux.just(returnValue))
+                .when(reactiveRedisTemplate)
+                .execute(any(RedisScript.class), anyList(), anyString(), anyString(), anyString(), anyString(), anyString());
+        // TossPaymentRateLimiter: 1 KEY + 4 ARGV (기존 형식 유지)
         lenient().doReturn(Flux.just(returnValue))
                 .when(reactiveRedisTemplate)
                 .execute(any(RedisScript.class), anyList(), anyString(), anyString(), anyString(), anyString());
@@ -67,6 +72,11 @@ class LeakyBucketRateLimiterTest {
 
     @SuppressWarnings("unchecked")
     private void mockRedisExecuteError() {
+        // GlobalRateLimiterService: 5 KEYS + 5 ARGV
+        lenient().doReturn(Flux.error(new RuntimeException("Redis connection failed")))
+                .when(reactiveRedisTemplate)
+                .execute(any(RedisScript.class), anyList(), anyString(), anyString(), anyString(), anyString(), anyString());
+        // TossPaymentRateLimiter: 1 KEY + 4 ARGV
         lenient().doReturn(Flux.error(new RuntimeException("Redis connection failed")))
                 .when(reactiveRedisTemplate)
                 .execute(any(RedisScript.class), anyList(), anyString(), anyString(), anyString(), anyString());

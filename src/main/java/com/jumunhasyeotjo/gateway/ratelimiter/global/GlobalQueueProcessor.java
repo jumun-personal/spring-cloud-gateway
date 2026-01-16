@@ -154,10 +154,12 @@ public class GlobalQueueProcessor {
     }
 
     private Mono<Void> processItem(QueueItem item, QueueType queueType, boolean isRetry) {
-        return globalRateLimiterService.tryConsume()
-                .flatMap(globalOk -> {
-                    if (!globalOk) {
-                        log.debug("Global token exhausted, re-queuing userId={}", item.getUserId());
+        // 대기열 요청이므로 isNewRequest=false
+        return globalRateLimiterService.tryConsume(false)
+                .flatMap(result -> {
+                    if (result != GlobalRateLimiterService.TryConsumeResult.ALLOWED) {
+                        log.debug("Global token exhausted (result={}), re-queuing userId={}",
+                                result, item.getUserId());
                         return requeue(item, queueType, isRetry);
                     }
                     return pgRateLimiterService.tryConsume(DEFAULT_PROVIDER)
