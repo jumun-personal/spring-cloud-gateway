@@ -13,6 +13,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -62,15 +63,15 @@ public class AllQueueMetrics {
                 .description("Number of requests in OTHER retry queue")
                 .register(meterRegistry);
 
-        // 5. Global Rate Limit - Max
+        // 5. Global Rate Limit - Max (Leaky Bucket leak rate)
         Gauge.builder("rate.limit.global.max", globalRateLimiterService,
                         GlobalRateLimiterService::getCurrentLimit)
-                .description("Global rate limit max (sliding window)")
+                .description("Global rate limit (leaky bucket leak rate)")
                 .register(meterRegistry);
 
-        // 6. Global Rate Limit - Current Usage
+        // 6. Global Rate Limit - Current Water Level
         Gauge.builder("rate.limit.global.current", cachedGlobalWindowCount, AtomicLong::get)
-                .description("Current requests in global sliding window")
+                .description("Current water level in global leaky bucket")
                 .register(meterRegistry);
 
         // 7. Global Rate Limit - Usage Ratio
@@ -83,13 +84,13 @@ public class AllQueueMetrics {
                 .baseUnit("percent")
                 .register(meterRegistry);
 
-        // 8. PG별 메트릭
+        // 8. PG별 메트릭 (Leaky Bucket)
         for (PaymentProviderRateLimiter rateLimiter : paymentProviderRateLimiters) {
             String provider = rateLimiter.getProviderName();
 
             Gauge.builder("rate.limit.pg." + provider + ".max", rateLimiter,
                             PaymentProviderRateLimiter::getRateLimit)
-                    .description("PG rate limit max tokens")
+                    .description("PG rate limit (leaky bucket leak rate)")
                     .register(meterRegistry);
 
             cachedPgCurrentTokens.put(provider, new AtomicLong(0));
@@ -97,7 +98,7 @@ public class AllQueueMetrics {
             Gauge.builder("rate.limit.pg." + provider + ".current",
                             cachedPgCurrentTokens.get(provider),
                             AtomicLong::get)
-                    .description("PG current available tokens")
+                    .description("PG current available capacity (leaky bucket)")
                     .register(meterRegistry);
 
             Gauge.builder("rate.limit.pg." + provider + ".usage", this, metrics -> {
@@ -161,17 +162,17 @@ public class AllQueueMetrics {
     }
 
     @Scheduled(fixedDelay = 1000, initialDelay = 1000)
-    public void updateGlobalWindowCount() {
+    public void updateGlobalWaterLevel() {
         globalRateLimiterService.getCurrentWindowCount()
                 .timeout(Duration.ofSeconds(2))
                 .subscribe(
-                        count -> {
-                            cachedGlobalWindowCount.set(count);
-                            int limit = globalRateLimiterService.getCurrentLimit();
-                            double usage = limit > 0 ? (double) count / limit * 100 : 0;
-                            log.info("Global: {}/{} ({}%)", count, limit, String.format("%.1f", usage));
+                        waterLevel -> {
+                            cachedGlobalWindowCount.set(waterLevel);
+                            int capacity = globalRateLimiterService.getCurrentLimit();
+                            double usage = capacity > 0 ? (double) waterLevel / capacity * 100 : 0;
+                            log.info("Global leaky bucket: {}/{} ({}%)", waterLevel, capacity, String.format("%.1f", usage));
                         },
-                        error -> log.warn("Failed to update global window count: {}", error.getMessage())
+                        error -> log.warn("Failed to update global water level: {}", error.getMessage())
                 );
     }
 

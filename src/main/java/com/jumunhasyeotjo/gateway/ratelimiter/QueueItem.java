@@ -3,6 +3,7 @@ package com.jumunhasyeotjo.gateway.ratelimiter;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.Objects;
 import java.util.UUID;
 
 @Data
@@ -34,5 +35,17 @@ public class QueueItem {
 
     public boolean isOlderThan(long thresholdMs) {
         return System.currentTimeMillis() - this.originalTimestamp > thresholdMs;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == null || getClass() != o.getClass()) return false;
+        QueueItem queueItem = (QueueItem) o;
+        return retryCount == queueItem.retryCount && originalTimestamp == queueItem.originalTimestamp && Objects.equals(requestId, queueItem.requestId) && Objects.equals(userId, queueItem.userId) && Objects.equals(accessToken, queueItem.accessToken) && Objects.equals(httpRequest, queueItem.httpRequest);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(requestId, userId, accessToken, httpRequest, retryCount, originalTimestamp);
     }
 }

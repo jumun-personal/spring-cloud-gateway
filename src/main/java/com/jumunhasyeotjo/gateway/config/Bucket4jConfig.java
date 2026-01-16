@@ -1,53 +1,17 @@
 package com.jumunhasyeotjo.gateway.config;
 
-
-import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
-import io.github.bucket4j.distributed.proxy.ProxyManager;
-import io.github.bucket4j.distributed.serialization.Mapper;
-import io.github.bucket4j.redis.redisson.Bucket4jRedisson;
-import org.redisson.Redisson;
-import org.redisson.api.RedissonClient;
-import org.redisson.config.Config;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.time.Duration;
-
+/**
+ * 기존 Bucket4j 설정은 Leaky Bucket 알고리즘으로 대체되었습니다.
+ *
+ * Rate Limiting은 이제 Redis Hash 기반의 Leaky Bucket을 사용합니다:
+ * - GlobalRateLimiterService: leaky:global:bucket
+ * - TossPaymentRateLimiter: leaky:pg:toss
+ *
+ * 이 설정 클래스는 향후 삭제 가능합니다 (Bucket4j 의존성 제거 시).
+ */
 @Configuration
 public class Bucket4jConfig {
-
-    @Value("${spring.data.redis.host:delivery-redis}")
-    private String redisHost;
-
-    @Value("${spring.data.redis.port:6379}")
-    private int redisPort;
-
-    @Bean
-    public RedissonClient redissonClient() {
-        Config config = new Config();
-        config.useSingleServer()
-                .setAddress("redis://" + redisHost + ":" + redisPort)
-                .setConnectionMinimumIdleSize(5)
-                .setConnectionPoolSize(10)
-                .setTimeout(3000)
-                .setRetryAttempts(3)
-                .setRetryInterval(1500);
-
-        return Redisson.create(config);
-    }
-
-    @Bean
-    public ProxyManager<String> proxyManager(RedissonClient redissonClient) {
-        Redisson redisson = (Redisson) redissonClient;
-
-        return Bucket4jRedisson.casBasedBuilder(redisson.getCommandExecutor())
-                .expirationAfterWrite(
-                        ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(
-                                Duration.ofSeconds(10)
-                        )
-                )
-                .keyMapper(Mapper.STRING)
-                .build();
-    }
+    // Bucket4j 및 Redisson 빈 제거됨 - Leaky Bucket으로 대체
 }
