@@ -35,6 +35,18 @@ public class ReactiveRateLimiterService {
         return rateLimiter.tryConsume();
     }
 
+    public Mono<Long> tryConsumeN(String provider, long n) {
+        PaymentProviderRateLimiter rl = rateLimiterMap.get(provider.toUpperCase());
+        if (rl == null) return Mono.error(new IllegalArgumentException("Unknown provider: " + provider));
+        return rl.tryConsumeN(n);
+    }
+
+    public Mono<Void> refundN(String provider, long n) {
+        PaymentProviderRateLimiter rl = rateLimiterMap.get(provider.toUpperCase());
+        if (rl == null) return Mono.error(new IllegalArgumentException("Unknown provider: " + provider));
+        return rl.refundN(n);
+    }
+
     // 토큰 있는 아무 PG 찾기
     public Mono<String> findAvailableProvider() {
         return Flux.fromIterable(rateLimiterMap.values())

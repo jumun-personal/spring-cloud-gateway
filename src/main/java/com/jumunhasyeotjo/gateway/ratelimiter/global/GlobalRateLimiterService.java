@@ -41,6 +41,22 @@ public class GlobalRateLimiterService {
     private final AtomicInteger leakRate = new AtomicInteger(15);
     private final AtomicInteger capacity = new AtomicInteger(15);
 
+    private static final String REFUND_N_FOR_QUEUE_SCRIPT = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        local refund = tonumber(ARGV[3])
+        
+        local waterLevel = tonumber(redis.call('HGET', key, 'water_level') or '0')
+        waterLevel = math.max(0, waterLevel - refund)
+        
+        redis.call('HSET', key, 'water_level', tostring(waterLevel))
+        redis.call('HSET', key, 'last_leak_time', tostring(now))
+        redis.call('EXPIRE', key, ttl)
+        
+        return waterLevel
+        """;
+
     // Leaky Bucket tryConsume Lua 스크립트 (큐 인식 버전)
     // KEYS[1]=버킷키, KEYS[2]=ORDER큐, KEYS[3]=OTHER큐, KEYS[4]=ORDER재시도큐, KEYS[5]=OTHER재시도큐
     // ARGV[1]=now, ARGV[2]=leakRate, ARGV[3]=capacity, ARGV[4]=ttl, ARGV[5]=isNewRequest
@@ -101,6 +117,36 @@ public class GlobalRateLimiterService {
         end
         """;
 
+    private final String TRY_CONSUME_N_FOR_QUEUE_SCRIPT = """
+            local key = KEYS[1]
+                local now = tonumber(ARGV[1])
+                local leakRate = tonumber(ARGV[2])
+                local capacity = tonumber(ARGV[3])
+                local ttl = tonumber(ARGV[4])
+                local requested = tonumber(ARGV[5])
+            
+                local waterLevel = tonumber(redis.call('HGET', key, 'water_level') or '0')
+                local lastLeakTime = tonumber(redis.call('HGET', key, 'last_leak_time') or tostring(now))
+            
+                local elapsedMs = now - lastLeakTime
+                if elapsedMs < 0 then elapsedMs = 0 end
+                local elapsedSec = elapsedMs / 1000.0
+                local leaked = leakRate * elapsedSec
+                waterLevel = math.max(0, waterLevel - leaked)
+            
+                local available = math.floor(capacity - waterLevel)
+                if available < 0 then available = 0 end
+            
+                local consume = math.min(requested, available)
+                waterLevel = waterLevel + consume
+            
+                redis.call('HSET', key, 'water_level', tostring(waterLevel))
+                redis.call('HSET', key, 'last_leak_time', tostring(now))
+                redis.call('EXPIRE', key, ttl)
+            
+                return consume
+        """;
+
     // 현재 water level 조회 Lua 스크립트
     private static final String GET_WATER_LEVEL_SCRIPT = """
         local key = KEYS[1]
@@ -119,13 +165,17 @@ public class GlobalRateLimiterService {
         return math.floor(waterLevel * 1000)
         """;
 
+    private RedisScript<Long> tryConsumeNForQueueScript;
     private RedisScript<Long> tryConsumeScript;
     private RedisScript<Long> getWaterLevelScript;
+    private RedisScript<Long> refundNForQueueScript;
 
     @PostConstruct
     public void init() {
         tryConsumeScript = RedisScript.of(TRY_CONSUME_SCRIPT, Long.class);
         getWaterLevelScript = RedisScript.of(GET_WATER_LEVEL_SCRIPT, Long.class);
+        tryConsumeNForQueueScript = RedisScript.of(TRY_CONSUME_N_FOR_QUEUE_SCRIPT, Long.class);
+        refundNForQueueScript = RedisScript.of(REFUND_N_FOR_QUEUE_SCRIPT, Long.class);
     }
 
     /**
@@ -167,6 +217,36 @@ public class GlobalRateLimiterService {
         .map(result -> TryConsumeResult.fromCode(result.intValue()))
         .defaultIfEmpty(TryConsumeResult.ERROR)
         .onErrorReturn(TryConsumeResult.ERROR);
+    }
+
+    public Mono<Long> tryConsumeNForQueue(long n) {
+        long now = System.currentTimeMillis();
+        if (n <= 0) return Mono.just(0L);
+
+        return reactiveRedisTemplate.execute(
+                        tryConsumeNForQueueScript,
+                        Collections.singletonList(KEY),
+                        String.valueOf(now),
+                        String.valueOf(leakRate.get()),
+                        String.valueOf(capacity.get()),
+                        String.valueOf(TTL_SECONDS),
+                        String.valueOf(n)
+                ).next()
+                .defaultIfEmpty(0L)
+                .onErrorReturn(0L);
+    }
+
+    public Mono<Void> refundNForQueue(long n) {
+        if (n <= 0) return Mono.empty();
+        long now = System.currentTimeMillis();
+
+        return reactiveRedisTemplate.execute(
+                refundNForQueueScript,
+                Collections.singletonList(KEY),
+                String.valueOf(now),
+                String.valueOf(TTL_SECONDS),
+                String.valueOf(n)
+        ).then();
     }
 
     public Mono<Long> getAvailableTokens() {

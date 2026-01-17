@@ -70,24 +70,37 @@ public class GlobalQueueProcessor {
         }
     }
 
-    /**
-     * Process queue using atomic Lua script (new optimized path).
-     * Reduces 14-16 Redis calls to 2 (PG check + Lua script).
-     */
     private void processWithLuaScript() {
-        pgRateLimiterService.getAvailableTokens(DEFAULT_PROVIDER)
-                .filter(pgTokens -> pgTokens > 0)
-                .flatMap(pgTokens -> {
-                    int availableSlots = Math.min(
-                            pgTokens.intValue(),
-                            globalRateLimiterService.getCurrentLimit()
-                    );
-                    if (availableSlots <= 0) {
-                        return Mono.empty();
-                    }
-                    return globalQueueService.pollWeighted(availableSlots, weightProperties);
+        int desired = globalRateLimiterService.getCurrentLimit();
+
+        pgRateLimiterService.tryConsumeN(DEFAULT_PROVIDER, desired)
+                .flatMap(pgConsumed -> {
+                    if (pgConsumed <= 0) return Mono.empty();
+
+                    return globalRateLimiterService.tryConsumeNForQueue(pgConsumed)
+                            .flatMap(globalConsumed -> {
+                                int allowed = (int) Math.min(pgConsumed, globalConsumed);
+                                if (allowed <= 0) {
+                                    // global이 0이면 pg에서 소비한 것 환불
+                                    return pgRateLimiterService.refundN(DEFAULT_PROVIDER, pgConsumed).then();
+                                }
+
+                                return globalQueueService.pollWeighted(allowed, weightProperties)
+                                        .flatMap(result -> {
+                                            int polled = result.getStats().getTotalPolled();
+                                            int refund = allowed - polled;
+
+                                            Mono<Void> refundMono = (refund > 0)
+                                                    ? Mono.when(
+                                                    pgRateLimiterService.refundN(DEFAULT_PROVIDER, refund),
+                                                    globalRateLimiterService.refundNForQueue(refund)
+                                            )
+                                                    : Mono.empty();
+
+                                            return refundMono.then(processPolledItems(result));
+                                        });
+                            });
                 })
-                .flatMap(this::processPolledItems)
                 .subscribe(null, e -> log.error("Queue processing error (Lua)", e));
     }
 

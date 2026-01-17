@@ -8,6 +8,8 @@ public interface PaymentProviderRateLimiter {
      * 토큰 소비 시도
      */
     Mono<Boolean> tryConsume();
+    Mono<Long> tryConsumeN(long n);
+    Mono<Void> refundN(long n);
 
     /**
      * PG사 이름

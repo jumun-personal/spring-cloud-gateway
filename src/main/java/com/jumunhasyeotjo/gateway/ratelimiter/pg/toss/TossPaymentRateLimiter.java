@@ -26,6 +26,54 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
     private static final int CAPACITY = 10;
     private static final int TTL_SECONDS = 60;
 
+    private static final String REFUND_N_SCRIPT = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        local refund = tonumber(ARGV[3])
+        
+        local waterLevel = tonumber(redis.call('HGET', key, 'water_level') or '0')
+        waterLevel = math.max(0, waterLevel - refund)
+        
+        redis.call('HSET', key, 'water_level', tostring(waterLevel))
+        redis.call('HSET', key, 'last_leak_time', tostring(now))
+        redis.call('EXPIRE', key, ttl)
+        
+        return waterLevel
+        """;
+
+
+    private static final String TRY_CONSUME_N_SCRIPT = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local leakRate = tonumber(ARGV[2])
+        local capacity = tonumber(ARGV[3])
+        local ttl = tonumber(ARGV[4])
+        local requested = tonumber(ARGV[5])
+        
+        local waterLevel = tonumber(redis.call('HGET', key, 'water_level') or '0')
+        local lastLeakTime = tonumber(redis.call('HGET', key, 'last_leak_time') or tostring(now))
+        
+        local elapsedMs = now - lastLeakTime
+        if elapsedMs < 0 then elapsedMs = 0 end
+        local elapsedSec = elapsedMs / 1000.0
+        local leaked = leakRate * elapsedSec
+        
+        waterLevel = math.max(0, waterLevel - leaked)
+        
+        local available = math.floor(capacity - waterLevel)
+        if available < 0 then available = 0 end
+        
+        local consume = math.min(requested, available)
+        waterLevel = waterLevel + consume
+        
+        redis.call('HSET', key, 'water_level', tostring(waterLevel))
+        redis.call('HSET', key, 'last_leak_time', tostring(now))
+        redis.call('EXPIRE', key, ttl)
+        
+        return consume
+        """;
+
     // Leaky Bucket tryConsume Lua 스크립트
     private static final String TRY_CONSUME_SCRIPT = """
         local key = KEYS[1]
@@ -77,11 +125,15 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
 
     private RedisScript<Long> tryConsumeScript;
     private RedisScript<Long> getWaterLevelScript;
+    private RedisScript<Long> tryConsumeNScript;
+    private RedisScript<Long> refundNScript;
 
     @PostConstruct
     public void init() {
         tryConsumeScript = RedisScript.of(TRY_CONSUME_SCRIPT, Long.class);
         getWaterLevelScript = RedisScript.of(GET_WATER_LEVEL_SCRIPT, Long.class);
+        tryConsumeNScript = RedisScript.of(TRY_CONSUME_N_SCRIPT, Long.class);
+        refundNScript = RedisScript.of(REFUND_N_SCRIPT, Long.class);
     }
 
     @Override
@@ -100,6 +152,37 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
         .map(result -> result == 1L)
         .defaultIfEmpty(false)
         .onErrorReturn(false);
+    }
+
+    public Mono<Long> tryConsumeN(long n) {
+        long now = System.currentTimeMillis();
+        if (n <= 0) return Mono.just(0L);
+
+        return reactiveRedisTemplate.execute(
+                        tryConsumeNScript,
+                        Collections.singletonList(BUCKET_KEY),
+                        String.valueOf(now),
+                        String.valueOf(RATE_LIMIT),
+                        String.valueOf(CAPACITY),
+                        String.valueOf(TTL_SECONDS),
+                        String.valueOf(n)
+                )
+                .next()
+                .defaultIfEmpty(0L)
+                .onErrorReturn(0L);
+    }
+
+    public Mono<Void> refundN(long n) {
+        if (n <= 0) return Mono.empty();
+        long now = System.currentTimeMillis();
+
+        return reactiveRedisTemplate.execute(
+                refundNScript,
+                Collections.singletonList(BUCKET_KEY),
+                String.valueOf(now),
+                String.valueOf(TTL_SECONDS),
+                String.valueOf(n)
+        ).then();
     }
 
     @Override
