@@ -6,6 +6,8 @@ import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import io.netty.channel.ConnectTimeoutException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -23,6 +25,7 @@ import java.net.ConnectException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Component
@@ -34,6 +37,7 @@ public class GlobalQueueProcessor {
     private final QueueWeightProperties weightProperties;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
+    private final MeterRegistry meterRegistry;
 
     @Value("${queue.use-lua-polling:true}")
     private boolean useLuaPolling;
@@ -46,13 +50,15 @@ public class GlobalQueueProcessor {
                                 ReactiveRateLimiterService pgRateLimiterService,
                                 QueueWeightProperties weightProperties,
                                 WebClient webClient,
-                                ObjectMapper objectMapper) {
+                                ObjectMapper objectMapper,
+                                MeterRegistry meterRegistry) {
         this.globalQueueService = globalQueueService;
         this.globalRateLimiterService = globalRateLimiterService;
         this.pgRateLimiterService = pgRateLimiterService;
         this.weightProperties = weightProperties;
         this.webClient = webClient;
         this.objectMapper = objectMapper;
+        this.meterRegistry = meterRegistry;
     }
 
     @Scheduled(fixedDelay = 100)
@@ -268,7 +274,19 @@ public class GlobalQueueProcessor {
         return globalQueueService.offer(item, queueType).then();
     }
 
+    private void recordWaitTime(long enqueueTimestamp, QueueType queueType, boolean isRetry) {
+        long waitTimeMs = System.currentTimeMillis() - enqueueTimestamp;
+        Timer.builder("queue.wait.time")
+                .description("Time spent waiting in the queue before processing")
+                .tag("queue_type", queueType.name())
+                .tag("retry", String.valueOf(isRetry))
+                .register(meterRegistry)
+                .record(waitTimeMs, TimeUnit.MILLISECONDS);
+    }
+
     private Mono<Void> executeRequest(QueueItem item, QueueType queueType, boolean isRetry) {
+        recordWaitTime(item.getOriginalTimestamp(), queueType, isRetry);
+
         HttpRequestData request = item.getHttpRequest();
         if (request == null) {
             log.warn("Invalid request data for userId={}", item.getUserId());
