@@ -22,8 +22,8 @@ public class TossPaymentRateLimiter implements PaymentProviderRateLimiter {
     private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
 
     private static final String BUCKET_KEY = "leaky:pg:toss";
-    private static final int RATE_LIMIT = 20;
-    private static final int CAPACITY = 20;
+    private static final int RATE_LIMIT = 10;
+    private static final int CAPACITY = 10;
     private static final int TTL_SECONDS = 60;
 
     // Leaky Bucket tryConsume Lua 스크립트
