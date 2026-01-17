@@ -71,37 +71,60 @@ public class GlobalQueueProcessor {
     }
 
     private void processWithLuaScript() {
-        int desired = globalRateLimiterService.getCurrentLimit();
+        int desired = globalRateLimiterService.getCurrentLimit(); // 15
 
-        pgRateLimiterService.tryConsumeN(DEFAULT_PROVIDER, desired)
-                .flatMap(pgConsumed -> {
-                    if (pgConsumed <= 0) return Mono.empty();
+        Mono<Integer> pgLaneUsedGlobal =
+                pgRateLimiterService.tryConsumeN(DEFAULT_PROVIDER, desired)
+                        .flatMap(pgReserved -> {
+                            if (pgReserved <= 0) return Mono.just(0);
 
-                    return globalRateLimiterService.tryConsumeNForQueue(pgConsumed)
-                            .flatMap(globalConsumed -> {
-                                int allowed = (int) Math.min(pgConsumed, globalConsumed);
-                                if (allowed <= 0) {
-                                    // global이 0이면 pg에서 소비한 것 환불
-                                    return pgRateLimiterService.refundN(DEFAULT_PROVIDER, pgConsumed).then();
-                                }
+                            return globalRateLimiterService.tryConsumeNForQueue(pgReserved)
+                                    .flatMap(globalReserved -> {
+                                        int allowed = (int) Math.min(pgReserved, globalReserved);
 
-                                return globalQueueService.pollWeighted(allowed, weightProperties)
-                                        .flatMap(result -> {
-                                            int polled = result.getStats().getTotalPolled();
-                                            int refund = allowed - polled;
+                                        if (allowed <= 0) {
+                                            return pgRateLimiterService.refundN(DEFAULT_PROVIDER, pgReserved)
+                                                    .thenReturn(0);
+                                        }
 
-                                            Mono<Void> refundMono = (refund > 0)
-                                                    ? Mono.when(
-                                                    pgRateLimiterService.refundN(DEFAULT_PROVIDER, refund),
-                                                    globalRateLimiterService.refundNForQueue(refund)
-                                            )
-                                                    : Mono.empty();
+                                        return globalQueueService.pollWeightedPg(allowed, weightProperties)
+                                                .flatMap(result -> refundIfShortAndProcess(result, allowed, true))
+                                                .thenReturn(allowed); // ✅ global 토큰 allowed 만큼 사용했다고 기록
+                                    });
+                        });
 
-                                            return refundMono.then(processPolledItems(result));
-                                        });
-                            });
-                })
-                .subscribe(null, e -> log.error("Queue processing error (Lua)", e));
+        Mono<Void> pipeline =
+                pgLaneUsedGlobal.flatMap(used -> {
+                    int remain = Math.max(0, desired - used);
+                    if (remain <= 0) return Mono.empty();
+
+                    return globalRateLimiterService.tryConsumeNForQueue(remain)
+                            .map(Long::intValue)
+                            .filter(allowed -> allowed > 0)
+                            .flatMap(allowed ->
+                                    globalQueueService.pollWeightedGlobalOnly(allowed, weightProperties)
+                                            .flatMap(result -> refundIfShortAndProcess(result, allowed, false))
+                            );
+                });
+
+        pipeline.subscribe(null, e -> log.error("Queue processing error (Lua)", e));
+    }
+
+    private Mono<Void> refundIfShortAndProcess(QueuePollResult result, int allowed, boolean isPgLane) {
+        int polled = result.getStats().getTotalPolled();
+        int refund = allowed - polled;
+
+        Mono<Void> refundMono = Mono.empty();
+        if (refund > 0) {
+            refundMono = isPgLane
+                    ? Mono.when(
+                    pgRateLimiterService.refundN(DEFAULT_PROVIDER, refund),
+                    globalRateLimiterService.refundNForQueue(refund)
+            )
+                    : globalRateLimiterService.refundNForQueue(refund).then();
+        }
+
+        return refundMono.then(processPolledItems(result));
     }
 
     /**

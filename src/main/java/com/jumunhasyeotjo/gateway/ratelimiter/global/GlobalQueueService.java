@@ -18,10 +18,7 @@ import reactor.core.publisher.Mono;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -31,11 +28,154 @@ public class GlobalQueueService {
     private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
     private final ObjectMapper objectMapper;
     private final GlobalRateLimiterService rateLimiterService;
+    // ===== Global-only queue keys (PG 불필요) =====
+    private static final String G_ORDER_KEY       = "queue:global:order";
+    private static final String G_ORDER_RETRY_KEY = "queue:global:order:retry";
+    private static final String G_OTHER_KEY       = "queue:global:other";
+    private static final String G_OTHER_RETRY_KEY = "queue:global:other:retry";
+
+    // ===== PG-required queue keys (PG 필요) =====
+    private static final String PG_ORDER_KEY       = "queue:pg:order";
+    private static final String PG_ORDER_RETRY_KEY = "queue:pg:order:retry";
+    private static final String PG_OTHER_KEY       = "queue:pg:other";
+    private static final String PG_OTHER_RETRY_KEY = "queue:pg:other:retry";
 
     @Value("classpath:scripts/queue_weighting.lua")
     private Resource queueWeightingScript;
+    private final String WEIGHTED_POLL_ONLY_LUA = """
+            --[[
+              Weighted Queue Polling (POLL-ONLY)
+              - NO token bucket update here (reserved in Java)
+              - Redis round trips: 1 (EVAL)
+              - Complexity: O(M log N)
+            ]]
+            
+            local orderNormalKey = KEYS[1]
+            local orderRetryKey  = KEYS[2]
+            local otherNormalKey = KEYS[3]
+            local otherRetryKey  = KEYS[4]
+            
+            local now            = tonumber(ARGV[1])
+            local totalSlots     = tonumber(ARGV[2])
+            local orderWeight    = tonumber(ARGV[3])
+            local otherWeight    = tonumber(ARGV[4])
+            local retryRatio     = tonumber(ARGV[5])
+            local retryThreshold = tonumber(ARGV[6])
+            
+            if totalSlots <= 0 then
+              return cjson.encode({
+                items = {},
+                stats = { order_retry=0, order_normal=0, other_retry=0, other_normal=0, total_polled=0, remaining_slots=0 }
+              })
+            end
+            
+            local result = {
+              items = {},
+              stats = { order_retry=0, order_normal=0, other_retry=0, other_normal=0, total_polled=0, remaining_slots=totalSlots }
+            }
+            
+            local function pollFromQueue(key, count, isRetry, threshold)
+              if count <= 0 then return {} end
+            
+              local items
+              if isRetry then
+                items = redis.call('ZRANGEBYSCORE', key, '-inf', threshold, 'WITHSCORES', 'LIMIT', 0, count)
+              else
+                items = redis.call('ZRANGE', key, 0, count - 1, 'WITHSCORES')
+              end
+            
+              local polled = {}
+              local toRemove = {}
+            
+              for i = 1, #items, 2 do
+                local member = items[i]
+                local score = items[i + 1]
+                table.insert(polled, { data = member, score = tonumber(score) })
+                table.insert(toRemove, member)
+              end
+            
+              if #toRemove > 0 then
+                redis.call('ZREM', key, unpack(toRemove))
+              end
+            
+              return polled
+            end
+            
+            local function calculateSlots(total, orderW, otherW, retryR)
+              local totalWeight = orderW + otherW
+              local orderTotal = math.floor(total * orderW / totalWeight + 0.5)
+              local otherTotal = total - orderTotal
+            
+              local orderRetrySlots  = math.floor(orderTotal * retryR + 0.5)
+              local orderNormalSlots = orderTotal - orderRetrySlots
+            
+              local otherRetrySlots  = math.floor(otherTotal * retryR + 0.5)
+              local otherNormalSlots = otherTotal - otherRetrySlots
+            
+              return {
+                order_retry  = orderRetrySlots,
+                order_normal = orderNormalSlots,
+                other_retry  = otherRetrySlots,
+                other_normal = otherNormalSlots
+              }
+            end
+            
+            local slots = calculateSlots(totalSlots, orderWeight, otherWeight, retryRatio)
+            local remainingSlots = totalSlots
+            local polledItems = {}
+            
+            -- 1) ORDER retry
+            local orderRetryItems = pollFromQueue(orderRetryKey, slots.order_retry, true, retryThreshold)
+            for _, it in ipairs(orderRetryItems) do it.queue='order_retry'; table.insert(polledItems, it) end
+            result.stats.order_retry = #orderRetryItems
+            remainingSlots = remainingSlots - #orderRetryItems
+            
+            -- ORDER retry unused -> ORDER normal
+            local orderNormalSlots = slots.order_normal + (slots.order_retry - #orderRetryItems)
+            
+            -- 2) ORDER normal
+            local orderNormalItems = pollFromQueue(orderNormalKey, orderNormalSlots, false, 0)
+            for _, it in ipairs(orderNormalItems) do it.queue='order_normal'; table.insert(polledItems, it) end
+            result.stats.order_normal = #orderNormalItems
+            remainingSlots = remainingSlots - #orderNormalItems
+            
+            -- ORDER unused -> OTHER split by retryRatio
+            local orderTotalUsed = #orderRetryItems + #orderNormalItems
+            local orderTotalAllocated = slots.order_retry + slots.order_normal
+            local orderUnused = orderTotalAllocated - orderTotalUsed
+            if orderUnused < 0 then orderUnused = 0 end
+            
+            local extraOtherRetry = math.floor(orderUnused * retryRatio + 0.5)
+            local extraOtherNormal = orderUnused - extraOtherRetry
+            
+            -- 3) OTHER retry
+            local otherRetrySlots = slots.other_retry + extraOtherRetry
+            local otherRetryItems = pollFromQueue(otherRetryKey, otherRetrySlots, true, retryThreshold)
+            for _, it in ipairs(otherRetryItems) do it.queue='other_retry'; table.insert(polledItems, it) end
+            result.stats.other_retry = #otherRetryItems
+            remainingSlots = remainingSlots - #otherRetryItems
+            
+            -- OTHER retry unused -> OTHER normal (+ extraOtherNormal)
+            local otherRetryUnused = otherRetrySlots - #otherRetryItems
+            if otherRetryUnused < 0 then otherRetryUnused = 0 end
+            
+            local otherNormalSlots = slots.other_normal + otherRetryUnused + extraOtherNormal
+            
+            -- 4) OTHER normal
+            local otherNormalItems = pollFromQueue(otherNormalKey, otherNormalSlots, false, 0)
+            for _, it in ipairs(otherNormalItems) do it.queue='other_normal'; table.insert(polledItems, it) end
+            result.stats.other_normal = #otherNormalItems
+            remainingSlots = remainingSlots - #otherNormalItems
+            
+            result.stats.total_polled = #polledItems
+            result.stats.remaining_slots = remainingSlots
+            result.items = polledItems
+            
+            return cjson.encode(result)
+            """;
 
     private RedisScript<String> weightedPollScript;
+    private RedisScript<String> weightedPollOnlyScript;
 
     public GlobalQueueService(ReactiveRedisTemplate<String, String> reactiveRedisTemplate,
                               ObjectMapper objectMapper,
@@ -54,6 +194,7 @@ public class GlobalQueueService {
         } else {
             log.warn("queue_weighting.lua script not found in classpath");
         }
+        weightedPollOnlyScript = RedisScript.of(WEIGHTED_POLL_ONLY_LUA, String.class);
     }
 
     private static final String ORDER_QUEUE_KEY = "queue:global:order";
@@ -72,6 +213,66 @@ public class GlobalQueueService {
         QueueType(String key, String retryKey) {
             this.key = key;
             this.retryKey = retryKey;
+        }
+    }
+
+    public Mono<QueuePollResult> pollWeightedPg(int totalSlots, QueueWeightProperties props) {
+        List<String> keys = List.of(
+                PG_ORDER_KEY,
+                PG_ORDER_RETRY_KEY,
+                PG_OTHER_KEY,
+                PG_OTHER_RETRY_KEY
+        );
+        return pollWeightedInternal(keys, totalSlots, props);
+    }
+
+    public Mono<QueuePollResult> pollWeightedGlobalOnly(int totalSlots, QueueWeightProperties props) {
+        List<String> keys = List.of(
+                G_ORDER_KEY,
+                G_ORDER_RETRY_KEY,
+                G_OTHER_KEY,
+                G_OTHER_RETRY_KEY
+        );
+        return pollWeightedInternal(keys, totalSlots, props);
+    }
+
+    private Mono<QueuePollResult> pollWeightedInternal(
+            List<String> keys,
+            int totalSlots,
+            QueueWeightProperties props
+    ) {
+        if (totalSlots <= 0) return Mono.just(QueuePollResult.empty());
+
+        long now = System.currentTimeMillis();
+        long retryThreshold = now - props.getRetryDelayMs(); // 예: 4000ms
+
+        // ARGV 순서 (Lua와 반드시 일치)
+        // ARGV[1]=now, [2]=totalSlots, [3]=orderWeight, [4]=otherWeight, [5]=retryRatio, [6]=retryThreshold
+        return reactiveRedisTemplate.execute(
+                        weightedPollOnlyScript,
+                        keys,
+                        String.valueOf(now),
+                        String.valueOf(totalSlots),
+                        String.valueOf(props.getOrder()),
+                        String.valueOf(props.getOther()),
+                        String.valueOf(props.getRetryRatio()),
+                        String.valueOf(retryThreshold)
+                )
+                .next()
+                .switchIfEmpty(Mono.just("{}"))
+                .flatMap(this::parsePollResultSafely);
+    }
+
+    private Mono<QueuePollResult> parsePollResultSafely(String json) {
+        try {
+            QueuePollResult result = objectMapper.readValue(json, QueuePollResult.class);
+            if (result == null) return Mono.just(QueuePollResult.empty());
+            if (result.getItems() == null) result.setItems(Collections.emptyList());
+            if (result.getStats() == null) result.setStats(new QueuePollResult.QueueStats(0,0,0,0,0,0));
+            if (result.getBucket() == null) result.setBucket(new QueuePollResult.BucketState(0.0, 0));
+            return Mono.just(result);
+        } catch (Exception e) {
+            return Mono.just(QueuePollResult.empty());
         }
     }
 

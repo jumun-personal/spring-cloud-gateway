@@ -1,5 +1,6 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -47,11 +48,17 @@ public class QueuePollResult {
     @NoArgsConstructor
     @AllArgsConstructor
     public static class QueueStats {
+        @JsonProperty("order_retry")
         private int orderRetry;
+        @JsonProperty("order_normal")
         private int orderNormal;
+        @JsonProperty("other_retry")
         private int otherRetry;
+        @JsonProperty("other_normal")
         private int otherNormal;
+        @JsonProperty("total_polled")
         private int totalPolled;
+        @JsonProperty("remaining_slots")
         private int remainingSlots;
     }
 

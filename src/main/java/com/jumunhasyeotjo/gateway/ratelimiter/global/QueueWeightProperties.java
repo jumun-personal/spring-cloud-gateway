@@ -30,4 +30,8 @@ public class QueueWeightProperties {
     public double getRetryRatio() {
         return Math.max(0.0, Math.min(1.0, retryRatio));
     }
+
+    public long getRetryDelayMs() {
+        return 4000;//ms
+    }
 }
