@@ -246,12 +246,12 @@ class LeakyBucketRateLimiterTest {
     @Test
     @DisplayName("Toss - getAvailableTokens")
     void toss_getAvailableTokens_shouldReturnAvailableCapacity() {
-        // Given: water level = 8 out of 20
-        mockRedisExecuteForWaterLevel(8000L);
+        // Given: water level = 3 out of 10
+        mockRedisExecuteForWaterLevel(3000L);
 
         // When & Then
         StepVerifier.create(tossPaymentRateLimiter.getAvailableTokens())
-                .expectNext(12L)  // 20 - 8
+                .expectNext(7L)  // 10 - 3
                 .verifyComplete();
     }
 
@@ -264,8 +264,8 @@ class LeakyBucketRateLimiterTest {
 
     @Test
     @DisplayName("Toss - getRateLimit")
-    void toss_getRateLimit_shouldReturn20() {
+    void toss_getRateLimit_shouldReturn10() {
         assertThat(tossPaymentRateLimiter.getRateLimit())
-                .isEqualTo(20);
+                .isEqualTo(10);
     }
 }

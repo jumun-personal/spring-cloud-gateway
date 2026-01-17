@@ -295,7 +295,8 @@ public class GlobalQueueService {
     public Mono<Boolean> offerToRetry(QueueItem item, QueueType queueType) {
         return Mono.fromCallable(() -> objectMapper.writeValueAsString(item))
                 .flatMap(value -> {
-                    double score = item.getOriginalTimestamp();
+                    // 현재 시간을 score로 사용하여 4초 후
+                    double score = System.currentTimeMillis();
                     return reactiveRedisTemplate.opsForZSet().add(queueType.getRetryKey(), value, score);
                 })
                 .doOnNext(added -> log.debug("Retry queue offer [{}]: {}", queueType, added));

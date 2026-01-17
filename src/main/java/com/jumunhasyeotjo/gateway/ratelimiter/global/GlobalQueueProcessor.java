@@ -6,6 +6,7 @@ import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.netty.channel.ConnectTimeoutException;
@@ -38,6 +39,8 @@ public class GlobalQueueProcessor {
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
+    private final RedisLatencyHistogramService histogramService;
+    private final FeedbackLoopStateManager stateManager;
 
     @Value("${queue.use-lua-polling:true}")
     private boolean useLuaPolling;
@@ -51,7 +54,9 @@ public class GlobalQueueProcessor {
                                 QueueWeightProperties weightProperties,
                                 WebClient webClient,
                                 ObjectMapper objectMapper,
-                                MeterRegistry meterRegistry) {
+                                MeterRegistry meterRegistry,
+                                RedisLatencyHistogramService histogramService,
+                                FeedbackLoopStateManager stateManager) {
         this.globalQueueService = globalQueueService;
         this.globalRateLimiterService = globalRateLimiterService;
         this.pgRateLimiterService = pgRateLimiterService;
@@ -59,6 +64,8 @@ public class GlobalQueueProcessor {
         this.webClient = webClient;
         this.objectMapper = objectMapper;
         this.meterRegistry = meterRegistry;
+        this.histogramService = histogramService;
+        this.stateManager = stateManager;
     }
 
     @Scheduled(fixedDelay = 100)
@@ -89,7 +96,7 @@ public class GlobalQueueProcessor {
 
                                         return globalQueueService.pollWeightedPg(allowed, weightProperties)
                                                 .flatMap(result -> refundIfShortAndProcess(result, allowed, true))
-                                                .thenReturn(allowed); // ✅ global 토큰 allowed 만큼 사용했다고 기록
+                                                .thenReturn(allowed);
                                     });
                         });
 
@@ -320,6 +327,15 @@ public class GlobalQueueProcessor {
                 .record(waitTimeMs, TimeUnit.MILLISECONDS);
     }
 
+    private void recordRetryResult(boolean success, QueueType queueType) {
+        Counter.builder("queue.retry.result")
+                .description("Retry request result")
+                .tag("queue_type", queueType.name())
+                .tag("success", String.valueOf(success))
+                .register(meterRegistry)
+                .increment();
+    }
+
     private Mono<Void> executeRequest(QueueItem item, QueueType queueType, boolean isRetry) {
         recordWaitTime(item.getOriginalTimestamp(), queueType, isRetry);
 
@@ -331,6 +347,7 @@ public class GlobalQueueProcessor {
 
         String path = extractPath(request.getUri());
         URI original = URI.create(request.getUri());
+        long requestStartTime = System.currentTimeMillis();
 
         return webClient
                 .method(HttpMethod.valueOf(request.getMethod()))
@@ -356,18 +373,32 @@ public class GlobalQueueProcessor {
                         response -> Mono.error(new RuntimeException("Server error: " + response.statusCode())))
                 .bodyToMono(String.class)
                 .timeout(REQUEST_TIMEOUT)
-                .doOnSuccess(r -> log.info("Processed {} request for userId={}, isRetry={}",
-                        DEFAULT_PROVIDER, item.getUserId(), isRetry))
+                .doOnSuccess(r -> {
+                    // 레이턴시 기록 (피드백 루프 활성화 시)
+                    if (stateManager.isActive()) {
+                        long latency = System.currentTimeMillis() - requestStartTime;
+                        histogramService.recordLatency(latency).subscribe();
+                    }
+                    // Retry 성공 메트릭
+                    if (isRetry) {
+                        recordRetryResult(true, queueType);
+                    }
+                    log.info("Processed {} request for userId={}, isRetry={}",
+                            DEFAULT_PROVIDER, item.getUserId(), isRetry);
+                })
                 .then()
                 .onErrorResume(e -> handleRequestError(e, item, queueType, isRetry));
     }
 
     private Mono<Void> handleRequestError(Throwable e, QueueItem item, QueueType queueType, boolean isRetry) {
-        log.error("Request failed for userId={}, isRetry={}, error={}",
-                item.getUserId(), isRetry, e.getMessage());
+        String errorType = e.getClass().getSimpleName();
+        String errorMsg = e.getMessage() != null ? e.getMessage() : "no message";
+        log.error("Request failed for userId={}, isRetry={}, error={}: {}",
+                item.getUserId(), isRetry, errorType, errorMsg);
 
         // 이미 재시도한 건 폐기
         if (isRetry) {
+            recordRetryResult(false, queueType);
             log.error("Retry failed, dropping request for userId={}", item.getUserId());
             return Mono.empty();
         }
@@ -375,11 +406,11 @@ public class GlobalQueueProcessor {
         // 재시도 가능한 에러인지 확인
         if (isRetryable(e) && item.canRetry()) {
             item.incrementRetryCount();
-            log.warn("Retryable error, moving to retry queue userId={}", item.getUserId());
+            log.warn("Retryable error ({}), moving to retry queue userId={}", errorType, item.getUserId());
             return globalQueueService.offerToRetry(item, queueType).then();
         }
 
-        log.error("Non-retryable error, dropping userId={}", item.getUserId());
+        log.error("Non-retryable error ({}), dropping userId={}", errorType, item.getUserId());
         return Mono.empty();
     }
 
