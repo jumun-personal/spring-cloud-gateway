@@ -1,12 +1,14 @@
 package com.jumunhasyeotjo.gateway.ratelimiter.global;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jumunhasyeotjo.gateway.ratelimiter.HttpRequestData;
 import com.jumunhasyeotjo.gateway.ratelimiter.QueueItem;
 import com.jumunhasyeotjo.gateway.ratelimiter.global.GlobalQueueService.QueueType;
 import com.jumunhasyeotjo.gateway.ratelimiter.pg.ReactiveRateLimiterService;
 import io.netty.channel.ConnectTimeoutException;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -14,19 +16,16 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.ConnectException;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Duration;
 import java.util.concurrent.TimeoutException;
 
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class GlobalQueueProcessor {
 
     private final GlobalQueueService globalQueueService;
@@ -34,19 +33,108 @@ public class GlobalQueueProcessor {
     private final ReactiveRateLimiterService pgRateLimiterService;
     private final QueueWeightProperties weightProperties;
     private final WebClient webClient;
+    private final ObjectMapper objectMapper;
+
+    @Value("${queue.use-lua-polling:true}")
+    private boolean useLuaPolling;
 
     private static final String DEFAULT_PROVIDER = "TOSS";
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(15);
 
+    public GlobalQueueProcessor(GlobalQueueService globalQueueService,
+                                GlobalRateLimiterService globalRateLimiterService,
+                                ReactiveRateLimiterService pgRateLimiterService,
+                                QueueWeightProperties weightProperties,
+                                WebClient webClient,
+                                ObjectMapper objectMapper) {
+        this.globalQueueService = globalQueueService;
+        this.globalRateLimiterService = globalRateLimiterService;
+        this.pgRateLimiterService = pgRateLimiterService;
+        this.weightProperties = weightProperties;
+        this.webClient = webClient;
+        this.objectMapper = objectMapper;
+    }
+
     @Scheduled(fixedDelay = 100)
     public void processQueue() {
+        if (useLuaPolling && globalQueueService.isWeightedPollAvailable()) {
+            processWithLuaScript();
+        } else {
+            processWithJava();
+        }
+    }
+
+    /**
+     * Process queue using atomic Lua script (new optimized path).
+     * Reduces 14-16 Redis calls to 2 (PG check + Lua script).
+     */
+    private void processWithLuaScript() {
+        pgRateLimiterService.getAvailableTokens(DEFAULT_PROVIDER)
+                .filter(pgTokens -> pgTokens > 0)
+                .flatMap(pgTokens -> {
+                    int availableSlots = Math.min(
+                            pgTokens.intValue(),
+                            globalRateLimiterService.getCurrentLimit()
+                    );
+                    if (availableSlots <= 0) {
+                        return Mono.empty();
+                    }
+                    return globalQueueService.pollWeighted(availableSlots, weightProperties);
+                })
+                .flatMap(this::processPolledItems)
+                .subscribe(null, e -> log.error("Queue processing error (Lua)", e));
+    }
+
+    /**
+     * Process polled items from Lua script result.
+     */
+    private Mono<Void> processPolledItems(QueuePollResult result) {
+        if (result.getItems().isEmpty()) {
+            return Mono.empty();
+        }
+
+        log.debug("Processing {} items (Lua) - ORDER: retry={}, normal={} | OTHER: retry={}, normal={}",
+                result.getStats().getTotalPolled(),
+                result.getStats().getOrderRetry(),
+                result.getStats().getOrderNormal(),
+                result.getStats().getOtherRetry(),
+                result.getStats().getOtherNormal());
+
+        return Flux.fromIterable(result.getItems())
+                .flatMap(item -> {
+                    QueueItem queueItem = deserializeQueueItem(item.getData());
+                    if (queueItem == null) {
+                        return Mono.empty();
+                    }
+                    QueueType queueType = item.getQueue().startsWith("order") ?
+                            QueueType.ORDER : QueueType.OTHER;
+                    boolean isRetry = item.getQueue().endsWith("retry");
+
+                    return executeRequest(queueItem, queueType, isRetry);
+                }, 1)  // concurrency = 1 for ordering
+                .then();
+    }
+
+    private QueueItem deserializeQueueItem(String json) {
+        try {
+            return objectMapper.readValue(json, QueueItem.class);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to deserialize QueueItem: {}", json, e);
+            return null;
+        }
+    }
+
+    /**
+     * Legacy Java-based queue processing (fallback path).
+     */
+    private void processWithJava() {
         pgRateLimiterService.getAvailableTokens(DEFAULT_PROVIDER)
                 .filter(pgTokens -> pgTokens > 0)
                 .flatMap(pgTokens -> globalRateLimiterService.getAvailableTokens()
                         .map(globalTokens -> Math.min(pgTokens.intValue(), globalTokens.intValue())))
                 .filter(availableSlots -> availableSlots > 0)
                 .flatMap(this::processWithDynamicWeight)
-                .subscribe(null, e -> log.error("Queue processing error", e));
+                .subscribe(null, e -> log.error("Queue processing error (Java)", e));
     }
 
     private Mono<Void> processWithDynamicWeight(int availableSlots) {
