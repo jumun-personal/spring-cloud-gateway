@@ -356,7 +356,6 @@ public class GlobalQueueProcessor {
                         .host("order-to-shipping-service")
                         .path(original.getPath())
                         .query(original.getQuery())
-                        .queryParam("provider", DEFAULT_PROVIDER)
                         .build(true))
                 .headers(headers -> {
                     headers.setContentType(MediaType.APPLICATION_JSON);
