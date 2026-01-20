@@ -15,7 +15,6 @@ public class GatewayApplication {
 
 	@PostConstruct
 	public void init() {
-		// Reactor의 비동기 스레드 간에 MDC 정보를 자동으로 전파하도록 설정
 		Hooks.enableAutomaticContextPropagation();
 	}
 }

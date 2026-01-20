@@ -62,6 +62,9 @@ dependencies {
 
     // Gateway MDC 전파 의존성 추가 
     implementation 'io.micrometer:micrometer-observation'
+
+    // WebClient
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
 }
 
 dependencyManagement {
